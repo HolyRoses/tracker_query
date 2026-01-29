@@ -4,7 +4,7 @@ Query a BitTorrent tracker announce endpoint and display swarm info (seeds, leec
 
 optional arguments:
   -h, --help                   show this help message and exit
-  -b, --batch                  Enable batch mode to query multiple trackers from a file (ignores --tracker and --format) (default: False)
+  -b, --batch                  Enable batch mode to query multiple trackers from a file (ignores --tracker) (default: False)
   -t URL, --tracker URL        Tracker announce URL (http://, https://, or udp://). Ignored in batch mode. (default: udp://open.stealth.si:80/announce)
   -H HEX, --hash HEX           Info hash (40 hex characters) (default: 5CB6C44712D494A87E8554839FB0541046B157AF)
   -e EVENT, --event EVENT      Announce event type (default: started)
