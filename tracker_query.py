@@ -780,9 +780,9 @@ def main():
     parser.add_argument(
         '-e', '--event',
         metavar='EVENT',
-        choices=['started', 'completed', 'stopped'],
+        choices=['started', 'completed', 'stopped', 'none'],
         default=DEFAULT_EVENT,
-        help="Announce event type"
+        help="Announce event type (choices: started, completed, stopped, none)"
     )
 
     parser.add_argument(
