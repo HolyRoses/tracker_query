@@ -166,6 +166,7 @@ def decode_dict_peers(peer_list):
 def format_table_output(data, show_peers=False):
     """Format data as a clean aligned table"""
     # Color codes for batch mode
+    BRIGHT_GREEN = '\033[1;32m'
     GREEN = '\033[0;32m'
     YELLOW = '\033[1;33m'
     RED = '\033[0;31m'
@@ -173,10 +174,30 @@ def format_table_output(data, show_peers=False):
     
     # Skip colors if not in batch mode (for cleaner single queries)
     if not data.get('batch_mode'):
-        GREEN = YELLOW = RED = NC = ''
+        BRIGHT_GREEN = GREEN = YELLOW = RED = NC = ''
     
     print("\nTracker Response Summary:")
     print("─" * 50)
+
+    # Display response time with color coding
+    response_time = data.get('response_time_ms')
+    if response_time is not None:
+        if response_time < 150:
+            color = BRIGHT_GREEN
+            speed = "Excellent"
+        elif response_time < 300:
+            color = GREEN
+            speed = "Good"
+        elif response_time < 500:
+            color = YELLOW
+            speed = "OK"
+        else:
+            color = RED
+            speed = "Slow"
+        print(f"Response Time:     {color}{response_time:>10.2f} ms ({speed}){NC}")
+    else:
+        print(f"Response Time:     {'N/A':>10}")
+
     print(f"Interval:          {data['interval']:>10} s")
     print(f"Min Interval:      {data['min_interval']:>10} s")
     print(f"Seeds:             {data['seeds']:>10}")
@@ -213,7 +234,7 @@ def format_json_output(data, show_peers=False):
 
 def format_csv_output(data, show_peers=False):
     """Format data as CSV"""
-    keys = ['interval', 'min_interval', 'seeds', 'leechers', 'downloaded', 'ipv4_peers', 'ipv6_peers']
+    keys = ['response_time_ms', 'interval', 'min_interval', 'seeds', 'leechers', 'downloaded', 'ipv4_peers', 'ipv6_peers']
     print("\n" + ",".join(keys))
     print(",".join(str(data.get(k, '?')) for k in keys))
     
@@ -244,6 +265,9 @@ def build_announce_url(tracker_url, info_hash_bytes, event, peer_id, num_want):
     return f"{tracker_url}?{query}"
 
 def test_http_tracker(tracker_url, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want):
+    """Test HTTP/HTTPS tracker and return response time in milliseconds"""
+    start_time = time.time()
+
     try:
         info_hash_bytes = bytes.fromhex(info_hash_hex)
         if len(info_hash_bytes) != 20:
@@ -263,9 +287,10 @@ def test_http_tracker(tracker_url, info_hash_hex, event, output_format, show_pee
 
     try:
         with urllib.request.urlopen(req, timeout=DEFAULT_TIMEOUT) as resp:
+            response_time_ms = (time.time() - start_time) * 1000
             status = resp.getcode()
             body = resp.read()
-            print(f"Status: {status}   Size: {len(body)} bytes")
+            print(f"Status: {status}   Size: {len(body)} bytes   Response time: {response_time_ms:.2f}ms")
 
             if status != 200:
                 print("Non-200 response — tracker likely dead or blocked")
@@ -326,7 +351,8 @@ def test_http_tracker(tracker_url, info_hash_hex, event, output_format, show_pee
                     'ipv6_bytes': len(peers_ipv6) if isinstance(peers_ipv6, bytes) else 0,
                     'peer_list': peer_list,
                     'num_want_requested': num_want,
-                    'total_peers_returned': total_peers_returned
+                    'total_peers_returned': total_peers_returned,
+                    'response_time_ms': round(response_time_ms, 2)
                 }
 
                 if output_format == 'json':
@@ -348,6 +374,9 @@ def test_http_tracker(tracker_url, info_hash_hex, event, output_format, show_pee
     except Exception as e:
         print(f"Request failed: {type(e).__name__}: {str(e)}")
         sys.exit(1)
+
+    # Return response time for batch mode tracking
+    return round(response_time_ms, 2) if 'response_time_ms' in locals() else None
 
 # ────────────────────────────────────────────────
 # UDP Tracker Functions
@@ -455,6 +484,9 @@ def udp_announce(sock, addr, connection_id, transaction_id, info_hash_bytes, eve
     }
 
 def test_udp_tracker(tracker_url, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want):
+    """Test UDP tracker and return response time in milliseconds"""
+    start_time = time.time()
+
     try:
         info_hash_bytes = bytes.fromhex(info_hash_hex)
         if len(info_hash_bytes) != 20:
@@ -504,11 +536,12 @@ def test_udp_tracker(tracker_url, info_hash_hex, event, output_format, show_peer
         print(f"Sending announce request (transaction_id: {transaction_id})...")
         try:
             announce_response = udp_announce(sock, addr, connection_id, transaction_id, info_hash_bytes, event, peer_id, num_want)
+            response_time_ms = (time.time() - start_time) * 1000
         except (TimeoutError, ValueError) as e:
             print(f"Announce failed: {e}")
             sys.exit(1)
         
-        print(f"Announce successful")
+        print(f"Announce successful   Response time: {response_time_ms:.2f}ms")
         
         # Decode peers
         peer_list = []
@@ -532,7 +565,8 @@ def test_udp_tracker(tracker_url, info_hash_hex, event, output_format, show_peer
             'ipv6_bytes': 0,
             'peer_list': peer_list,
             'num_want_requested': num_want,
-            'total_peers_returned': total_peers_returned
+            'total_peers_returned': total_peers_returned,
+            'response_time_ms': round(response_time_ms, 2)
         }
         
         if output_format == 'json':
@@ -545,31 +579,34 @@ def test_udp_tracker(tracker_url, info_hash_hex, event, output_format, show_peer
     finally:
         sock.close()
 
+    # Return response time for batch mode tracking
+    return round(response_time_ms, 2) if 'response_time_ms' in locals() else None
+
 # ────────────────────────────────────────────────
 # Main dispatcher
 # ────────────────────────────────────────────────
 
 def test_tracker(tracker_url, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want):
-    """Route to HTTP or UDP tracker based on URL scheme (returns success/failure for batch mode)"""
+    """Route to HTTP or UDP tracker based on URL scheme (returns (success, response_time) for batch mode)"""
     try:
-        _test_tracker_impl(tracker_url, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want)
-        return True
+        response_time = _test_tracker_impl(tracker_url, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want)
+        return True, response_time
     except SystemExit as e:
         # Catch sys.exit() calls and convert to return value
-        return e.code == 0
+        return (e.code == 0), None
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
-        return False
+        return False, None
 
 def _test_tracker_impl(tracker_url, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want):
-    """Internal implementation - routes to HTTP or UDP tracker based on URL scheme"""
+    """Internal implementation - routes to HTTP or UDP tracker based on URL scheme, returns response_time"""
     parsed = urllib.parse.urlparse(tracker_url)
     scheme = parsed.scheme.lower()
     
     if scheme in ('http', 'https'):
-        test_http_tracker(tracker_url, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want)
+        return test_http_tracker(tracker_url, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want)
     elif scheme == 'udp':
-        test_udp_tracker(tracker_url, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want)
+        return test_udp_tracker(tracker_url, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want)
     else:
         print(f"Error: Unsupported tracker scheme '{scheme}'. Only http, https, and udp are supported.", file=sys.stderr)
         sys.exit(2)
@@ -629,6 +666,7 @@ def batch_query_trackers(tracker_file, info_hash_hex, event, output_format, show
     failed_count = 0
     success_list = []
     failed_list = []
+    response_times = []
     
     # Query each tracker
     for i, tracker in enumerate(trackers, 1):
@@ -637,12 +675,14 @@ def batch_query_trackers(tracker_file, info_hash_hex, event, output_format, show
         print("")
         
         # Query the tracker - use table format always in batch mode
-        success = test_tracker(tracker, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want)
+        success, response_time = test_tracker(tracker, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want)
         
         if success:
             success_count += 1
-            success_list.append(tracker)
-            print(f"{GREEN}✓ Success{NC}")
+            success_list.append((tracker, response_time))
+            response_times.append(response_time)
+            time_str = f" ({response_time:.2f}ms)" if response_time is not None else ""
+            print(f"{GREEN}✓ Success{time_str}{NC}")
         else:
             failed_count += 1
             failed_list.append(tracker)
@@ -659,14 +699,38 @@ def batch_query_trackers(tracker_file, info_hash_hex, event, output_format, show
     print(f"Total trackers: {BLUE}{total}{NC}")
     print(f"Successful: {GREEN}{success_count}{NC}")
     print(f"Failed: {RED}{failed_count}{NC}")
+
+    # Response time statistics
+    if response_times:
+        avg_time = sum(response_times) / len(response_times)
+        min_time = min(response_times)
+        max_time = max(response_times)
+        print(f"\n{BLUE}Response Time Statistics:{NC}")
+        print(f"  Average: {avg_time:.2f}ms")
+        print(f"  Fastest: {min_time:.2f}ms")
+        print(f"  Slowest: {max_time:.2f}ms")
     print(f"{BLUE}{'=' * 40}{NC}")
     
     # List successful trackers
     if success_count > 0:
-        print(f"\n{GREEN}✓ Successful Trackers ({success_count}):{NC}")
-        print(f"{GREEN}{'─' * 40}{NC}")
-        for tracker in success_list:
-            print(f"  {GREEN}•{NC} {tracker}")
+        # Sort by response time (fastest first)
+        success_list.sort(key=lambda x: x[1] if x[1] is not None else float('inf'))
+        print(f"\n{GREEN}✓ Successful Trackers ({success_count}) - sorted by speed:{NC}")
+        print(f"{GREEN}{'─' * 70}{NC}")
+        for tracker, resp_time in success_list:
+            if resp_time is not None:
+                # Color code based on speed (4-tier system)
+                if resp_time < 150:
+                    time_color = '\033[1;32m'  # Bright Green (Excellent)
+                elif resp_time < 300:
+                    time_color = GREEN  # Green (Good)
+                elif resp_time < 500:
+                    time_color = YELLOW  # Yellow (OK)
+                else:
+                    time_color = RED  # Red (Slow)
+                print(f"  {time_color}{resp_time:>7.2f}ms{NC}  {tracker}")
+            else:
+                print(f"  {'    N/A':>10}  {tracker}")
     
     # List failed trackers
     if failed_count > 0:
