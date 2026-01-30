@@ -32,6 +32,9 @@ import os
 # Defaults
 # ────────────────────────────────────────────────
 
+# Global flag for color output (set by command-line argument)
+NOCOLOR = False
+
 DEFAULT_INFO_HASH_HEX = '5CB6C44712D494A87E8554839FB0541046B157AF'
 DEFAULT_TRACKER       = 'udp://open.stealth.si:80/announce'
 DEFAULT_PEER_ID       = b'-qB5140-' + os.urandom(12)
@@ -172,8 +175,8 @@ def format_table_output(data, show_peers=False):
     RED = '\033[0;31m'
     NC = '\033[0m'  # No Color
     
-    # Skip colors if not in batch mode (for cleaner single queries)
-    if not data.get('batch_mode'):
+    # Skip colors if not in batch mode or if nocolor flag is set
+    if not data.get('batch_mode') or NOCOLOR:
         BRIGHT_GREEN = GREEN = YELLOW = RED = NC = ''
     
     print("\nTracker Response Summary:")
@@ -624,6 +627,10 @@ def batch_query_trackers(tracker_file, info_hash_hex, event, output_format, show
     BLUE = '\033[0;34m'
     NC = '\033[0m'  # No Color
     
+    # Disable colors if NOCOLOR flag is set
+    if NOCOLOR:
+        RED = GREEN = YELLOW = BLUE = NC = ''
+
     # Read and count trackers
     try:
         with open(tracker_file, 'r') as f:
@@ -828,7 +835,17 @@ def main():
         help="Delay between queries in batch mode (in seconds). Ignored in single-tracker mode."
     )
 
+    parser.add_argument(
+        '--nocolor',
+        action='store_true',
+        help="Disable colored output (useful for redirecting to files)"
+    )
+
     args = parser.parse_args()
+
+    # Set global NOCOLOR flag
+    global NOCOLOR
+    NOCOLOR = args.nocolor
 
     # Determine client info
     if args.random_qb:
