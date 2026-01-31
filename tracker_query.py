@@ -930,7 +930,8 @@ def main():
         batch_query_trackers(args.file, args.hash, args.event, args.format, args.show_peers, user_agent, peer_id, args.num_want, args.delay, args.random_qb)
     else:
         # Single tracker mode
-        test_tracker(args.tracker, args.hash, args.event, args.format, args.show_peers, user_agent, peer_id, args.num_want)
+        success, response_time = test_tracker(args.tracker, args.hash, args.event, args.format, args.show_peers, user_agent, peer_id, args.num_want)
+        sys.exit(0 if success else 1)
 
 if __name__ == '__main__':
     main()
