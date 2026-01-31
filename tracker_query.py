@@ -46,15 +46,34 @@ DEFAULT_NUM_WANT      = 50
 # qBittorrent version data for --random-qb
 QB_VERSIONS = [
     ('4.1.9.1', '4191'),
+
+    ('4.3.2',   '4320'),
+    ('4.3.8',   '4380'),
+    ('4.3.9',   '4390'),
+
+    ('4.4.1',   '4410'),
     ('4.4.3.1', '4431'),
+    ('4.4.5',   '4450'),
+
+    ('4.5.0',   '4500'),
+    ('4.5.2',   '4520'),
+    ('4.5.5',   '4550'),
+
     ('4.6.3',   '4630'),
     ('4.6.4',   '4640'),
+    ('4.6.5',   '4650'),
+    ('4.6.6',   '4660'),
+    ('4.6.7',   '4670'),
+
     ('5.0.2',   '5020'),
     ('5.0.3',   '5030'),
     ('5.0.4',   '5040'),
     ('5.0.5',   '5050'),
+
     ('5.1.0',   '5100'),
+    ('5.1.1',   '5110'),
     ('5.1.2',   '5120'),
+    ('5.1.3',   '5130'),
     ('5.1.4',   '5140'),
 ]
 
@@ -618,7 +637,7 @@ def _test_tracker_impl(tracker_url, info_hash_hex, event, output_format, show_pe
 # Batch mode functionality
 # ────────────────────────────────────────────────
 
-def batch_query_trackers(tracker_file, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want, delay):
+def batch_query_trackers(tracker_file, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want, delay, random_qb):
     """Query multiple trackers from a file"""
     # Color codes
     RED = '\033[0;31m'
@@ -681,6 +700,10 @@ def batch_query_trackers(tracker_file, info_hash_hex, event, output_format, show
         print(f"{YELLOW}{tracker}{NC}")
         print("")
         
+        # Get new random client for each query if --random-qb is enabled
+        if random_qb:
+            user_agent, peer_id = get_random_qb_client()
+
         # Query the tracker - use table format always in batch mode
         success, response_time = test_tracker(tracker, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want)
         
@@ -856,7 +879,7 @@ def main():
 
     # Run batch or single mode
     if args.batch:
-        batch_query_trackers(args.file, args.hash, args.event, args.format, args.show_peers, user_agent, peer_id, args.num_want, args.delay)
+        batch_query_trackers(args.file, args.hash, args.event, args.format, args.show_peers, user_agent, peer_id, args.num_want, args.delay, args.random_qb)
     else:
         # Single tracker mode
         test_tracker(args.tracker, args.hash, args.event, args.format, args.show_peers, user_agent, peer_id, args.num_want)
