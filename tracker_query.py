@@ -281,8 +281,13 @@ def build_announce_url(tracker_url, info_hash_bytes, event, peer_id, num_want):
         'compact':     '1',
         'no_peer_id':  '1',
         'numwant':     str(num_want),
-        'event':       event,
     }
+
+    # Only include event when it's one of the explicit ones
+    if event in ('started', 'completed', 'stopped'):
+        params['event'] = event
+    # else: omit entirely → means "none" / regular announce
+
     query = urllib.parse.urlencode(params, doseq=False, safe='~')
     return f"{tracker_url}?{query}"
 
