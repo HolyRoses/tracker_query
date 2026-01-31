@@ -409,22 +409,22 @@ def parse_udp_url(tracker_url):
     parsed = urllib.parse.urlparse(tracker_url)
     if parsed.scheme != 'udp':
         raise ValueError(f"Expected udp:// scheme, got {parsed.scheme}://")
-    
+
     hostname = parsed.hostname
     port = parsed.port if parsed.port else 80
-    
+
     if not hostname:
         raise ValueError("Invalid UDP tracker URL - no hostname")
-    
+
     return hostname, port
 
 def udp_connect(sock, addr, transaction_id):
     """Send UDP connect request and return connection_id"""
     # Connect request: protocol_id (8) + action (4) + transaction_id (4)
     request = struct.pack('!QII', UDP_PROTOCOL_ID, UDP_ACTION_CONNECT, transaction_id)
-    
+
     sock.sendto(request, addr)
-    
+
     try:
         response, _ = sock.recvfrom(16)
     except socket.timeout:
@@ -435,13 +435,13 @@ def udp_connect(sock, addr, transaction_id):
     
     # Response: action (4) + transaction_id (4) + connection_id (8)
     action, resp_transaction_id, connection_id = struct.unpack('!IIQ', response)
-    
+
     if action != UDP_ACTION_CONNECT:
         raise ValueError(f"Expected action {UDP_ACTION_CONNECT}, got {action}")
-    
+
     if resp_transaction_id != transaction_id:
         raise ValueError(f"Transaction ID mismatch: sent {transaction_id}, got {resp_transaction_id}")
-    
+
     return connection_id
 
 def udp_announce(sock, addr, connection_id, transaction_id, info_hash_bytes, event, peer_id, num_want):
@@ -449,12 +449,12 @@ def udp_announce(sock, addr, connection_id, transaction_id, info_hash_bytes, eve
     # Map event string to UDP event codes
     event_map = {'started': 2, 'completed': 1, 'stopped': 3, 'none': 0}
     event_code = event_map.get(event, 0)
-    
+
     # Announce request format:
     # connection_id (8) + action (4) + transaction_id (4) + info_hash (20) +
     # peer_id (20) + downloaded (8) + left (8) + uploaded (8) + event (4) +
     # ip (4) + key (4) + num_want (4) + port (2)
-    
+
     request = struct.pack(
         '!QII20s20sQQQIIIIH',
         connection_id,           # connection_id
@@ -471,33 +471,33 @@ def udp_announce(sock, addr, connection_id, transaction_id, info_hash_bytes, eve
         num_want,                # num_want
         6881                     # port
     )
-    
+
     sock.sendto(request, addr)
-    
+
     try:
         response, _ = sock.recvfrom(65536)
     except socket.timeout:
         raise TimeoutError("UDP announce request timed out")
-    
+
     if len(response) < 20:
         raise ValueError(f"UDP announce response too short: {len(response)} bytes")
-    
+
     # Response: action (4) + transaction_id (4) + interval (4) + leechers (4) + seeders (4) + peers (6*n)
     action, resp_transaction_id, interval, leechers, seeders = struct.unpack('!IIIII', response[:20])
-    
+
     if action == 3:  # Error action
         error_msg = response[8:].decode('utf-8', errors='replace')
         raise ValueError(f"Tracker error: {error_msg}")
-    
+
     if action != UDP_ACTION_ANNOUNCE:
         raise ValueError(f"Expected action {UDP_ACTION_ANNOUNCE}, got {action}")
-    
+
     if resp_transaction_id != transaction_id:
         raise ValueError(f"Transaction ID mismatch: sent {transaction_id}, got {resp_transaction_id}")
-    
+
     # Extract peer data (rest of response after header)
     peers_data = response[20:]
-    
+
     return {
         'interval': interval,
         'leechers': leechers,
@@ -516,31 +516,43 @@ def test_udp_tracker(tracker_url, info_hash_hex, event, output_format, show_peer
     except ValueError as e:
         print(f"Error: Invalid info hash — {e}", file=sys.stderr)
         sys.exit(2)
-    
+
     try:
         hostname, port = parse_udp_url(tracker_url)
     except ValueError as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(2)
-    
+
     print(f"\n{'─' * 50}")
     print(f"UDP {event.upper()} → {tracker_url}")
     print(f"{'─' * 50}")
     print(f"Client: {user_agent}")
     print(f"Connecting to: {hostname}:{port}")
-    
-    # Create UDP socket
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.settimeout(DEFAULT_TIMEOUT)
-    
+
+    # Resolve hostname to determine IP version
     try:
-        # Resolve hostname
-        try:
-            addr = (socket.gethostbyname(hostname), port)
-        except socket.gaierror as e:
-            print(f"DNS resolution failed: {e}")
+        addr_info = socket.getaddrinfo(hostname, port, socket.AF_UNSPEC, socket.SOCK_DGRAM)
+        if not addr_info:
+            print(f"DNS resolution failed: No address found for {hostname}")
             sys.exit(1)
-        
+
+        # Use the first available address
+        family, socktype, proto, canonname, sockaddr = addr_info[0]
+        addr = sockaddr
+
+        # Determine if IPv4 or IPv6
+        is_ipv6 = family == socket.AF_INET6
+        print(f"Resolved to: {sockaddr[0]} ({'IPv6' if is_ipv6 else 'IPv4'})")
+
+    except socket.gaierror as e:
+        print(f"DNS resolution failed: {e}")
+        sys.exit(1)
+
+    # Create UDP socket with appropriate family
+    sock = socket.socket(family, socket.SOCK_DGRAM)
+    sock.settimeout(DEFAULT_TIMEOUT)
+
+    try:
         # Generate transaction ID
         transaction_id = random.randint(0, 0xFFFFFFFF)
         
@@ -565,32 +577,56 @@ def test_udp_tracker(tracker_url, info_hash_hex, event, output_format, show_peer
         
         print(f"Announce successful   Response time: {response_time_ms:.2f}ms")
         
-        # Decode peers
-        peer_list = []
+        # Decode peers according to the address family we used
         peers_data = announce_response['peers_data']
-        
+        peer_list = []
+        ipv4_peers = 0
+        ipv6_peers = 0
+        ipv4_bytes = 0
+        ipv6_bytes = 0
+
         if len(peers_data) > 0:
-            peer_list.extend(decode_compact_peers_ipv4(peers_data))
-        
-        ipv4_count = len(peers_data) // 6 if len(peers_data) > 0 else 0
+            if is_ipv6:
+                # We announced over IPv6 → expect only IPv6 peers (18-byte stride)
+                if len(peers_data) % 18 != 0:
+                    print("Warning: peers data length not divisible by 18 (IPv6 expected)")
+                peer_list = decode_compact_peers_ipv6(peers_data)
+                ipv6_peers = len(peer_list)
+                ipv6_bytes = len(peers_data)
+            else:
+                # Announced over IPv4 → expect only IPv4 peers (6-byte stride)
+                if len(peers_data) % 6 != 0:
+                    print("Warning: peers data length not divisible by 6 (IPv4 expected)")
+                peer_list = decode_compact_peers_ipv4(peers_data)
+                ipv4_peers = len(peer_list)
+                ipv4_bytes = len(peers_data)
+
+        # Small debug output
+        if ipv6_peers > 0:
+            print(f"  → Received {ipv6_peers} IPv6 peers")
+        elif ipv4_peers > 0:
+            print(f"  → Received {ipv4_peers} IPv4 peers")
+        elif len(peers_data) > 0:
+            print(f"  → Received {len(peers_data)} bytes of peers (format unknown)")
+
         total_peers_returned = len(peer_list)
-        
+
         data = {
             'interval': announce_response['interval'],
-            'min_interval': announce_response['interval'],  # UDP doesn't provide min_interval
+            'min_interval': announce_response['interval'],  # UDP has no min_interval
             'seeds': announce_response['seeders'],
             'leechers': announce_response['leechers'],
-            'downloaded': '?',  # UDP doesn't provide download count
-            'ipv4_peers': ipv4_count,
-            'ipv4_bytes': len(peers_data),
-            'ipv6_peers': 0,  # Basic UDP announce doesn't include IPv6
-            'ipv6_bytes': 0,
+            'downloaded': '?',
+            'ipv4_peers': ipv4_peers,
+            'ipv4_bytes': ipv4_bytes,
+            'ipv6_peers': ipv6_peers,
+            'ipv6_bytes': ipv6_bytes,
             'peer_list': peer_list,
             'num_want_requested': num_want,
             'total_peers_returned': total_peers_returned,
             'response_time_ms': round(response_time_ms, 2)
         }
-        
+
         if output_format == 'json':
             format_json_output(data, show_peers)
         elif output_format == 'csv':
@@ -645,7 +681,7 @@ def batch_query_trackers(tracker_file, info_hash_hex, event, output_format, show
     YELLOW = '\033[1;33m'
     BLUE = '\033[0;34m'
     NC = '\033[0m'  # No Color
-    
+
     # Disable colors if NOCOLOR flag is set
     if NOCOLOR:
         RED = GREEN = YELLOW = BLUE = NC = ''
@@ -660,20 +696,20 @@ def batch_query_trackers(tracker_file, info_hash_hex, event, output_format, show
     except Exception as e:
         print(f"{RED}Error reading tracker file: {e}{NC}", file=sys.stderr)
         sys.exit(1)
-    
+
     # Filter out comments and empty lines
     trackers = []
     for line in lines:
         line = line.strip()
         if line and not line.startswith('#'):
             trackers.append(line)
-    
+
     total = len(trackers)
-    
+
     if total == 0:
         print(f"{RED}Error: No trackers found in {tracker_file}{NC}", file=sys.stderr)
         sys.exit(1)
-    
+
     # Header
     print(f"{BLUE}{'=' * 40}{NC}")
     print(f"{BLUE}Batch Tracker Query{NC}")
@@ -686,27 +722,27 @@ def batch_query_trackers(tracker_file, info_hash_hex, event, output_format, show
     print(f"Delay: {GREEN}{delay}s{NC}")
     print(f"Info hash: {GREEN}{info_hash_hex}{NC}")
     print(f"{BLUE}{'=' * 40}{NC}\n")
-    
+
     # Statistics
     success_count = 0
     failed_count = 0
     success_list = []
     failed_list = []
     response_times = []
-    
+
     # Query each tracker
     for i, tracker in enumerate(trackers, 1):
         print(f"\n{BLUE}[{i}/{total}]{NC} Querying tracker...")
         print(f"{YELLOW}{tracker}{NC}")
         print("")
-        
+
         # Get new random client for each query if --random-qb is enabled
         if random_qb:
             user_agent, peer_id = get_random_qb_client()
 
         # Query the tracker - use table format always in batch mode
         success, response_time = test_tracker(tracker, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want)
-        
+
         if success:
             success_count += 1
             success_list.append((tracker, response_time))
@@ -717,11 +753,11 @@ def batch_query_trackers(tracker_file, info_hash_hex, event, output_format, show
             failed_count += 1
             failed_list.append(tracker)
             print(f"{RED}✗ Failed{NC}")
-        
+
         # Delay between requests (except after last one)
         if i < total and delay > 0:
             time.sleep(delay)
-    
+
     # Summary
     print(f"\n{BLUE}{'=' * 40}{NC}")
     print(f"{BLUE}Summary{NC}")
@@ -740,7 +776,7 @@ def batch_query_trackers(tracker_file, info_hash_hex, event, output_format, show
         print(f"  Fastest: {min_time:.2f}ms")
         print(f"  Slowest: {max_time:.2f}ms")
     print(f"{BLUE}{'=' * 40}{NC}")
-    
+
     # List successful trackers
     if success_count > 0:
         # Sort by response time (fastest first)
@@ -761,16 +797,16 @@ def batch_query_trackers(tracker_file, info_hash_hex, event, output_format, show
                 print(f"  {time_color}{resp_time:>7.2f}ms{NC}  {tracker}")
             else:
                 print(f"  {'    N/A':>10}  {tracker}")
-    
+
     # List failed trackers
     if failed_count > 0:
         print(f"\n{RED}✗ Failed Trackers ({failed_count}):{NC}")
         print(f"{RED}{'─' * 40}{NC}")
         for tracker in failed_list:
             print(f"  {RED}•{NC} {tracker}")
-    
+
     print("")
-    
+
     # Exit with error if all failed
     if success_count == 0:
         sys.exit(1)
