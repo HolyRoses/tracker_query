@@ -603,7 +603,14 @@ def test_udp_tracker(tracker_url, info_hash_hex, event, output_format, show_peer
 
         # Small debug output
         if ipv6_peers > 0:
-            print(f"  → Received {ipv6_peers} IPv6 peers")
+            # Detect IPv4-mapped IPv6 addresses (::ffff:x.x.x.x)
+            # Only seen this behavior from: udp://tracker.theoks.net:6969/announce
+            ipv4_mapped = sum(1 for p in peer_list if p.get('ip', '').startswith('::ffff:'))
+            if ipv4_mapped > 0:
+                native_ipv6 = ipv6_peers - ipv4_mapped
+                print(f"  → Received {ipv6_peers} IPv6 peers ({ipv4_mapped} IPv4-mapped, {native_ipv6} native IPv6)")
+            else:
+                print(f"  → Received {ipv6_peers} IPv6 peers")
         elif ipv4_peers > 0:
             print(f"  → Received {ipv4_peers} IPv4 peers")
         elif len(peers_data) > 0:
