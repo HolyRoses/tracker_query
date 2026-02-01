@@ -592,19 +592,26 @@ def test_udp_tracker(tracker_url, info_hash_hex, event, output_format, show_peer
 
         if len(peers_data) > 0:
             if is_ipv6:
-                # We announced over IPv6 → expect only IPv6 peers (18-byte stride)
-                if len(peers_data) % 18 != 0:
-                    print("Warning: peers data length not divisible by 18 (IPv6 expected)")
-                peer_list = decode_compact_peers_ipv6(peers_data)
-                ipv6_peers = len(peer_list)
-                ipv6_bytes = len(peers_data)
+                # Try IPv6 format first, fall back to IPv4 if needed
+                if len(peers_data) % 18 == 0:
+                    peer_list = decode_compact_peers_ipv6(peers_data)
+                    ipv6_peers = len(peer_list)
+                    ipv6_bytes = len(peers_data)
+                elif len(peers_data) % 6 == 0:
+                    print("Warning: Connected via IPv6 but received IPv4 peers response")
+                    peer_list = decode_compact_peers_ipv4(peers_data)
+                    ipv4_peers = len(peer_list)
+                    ipv4_bytes = len(peers_data)
+                else:
+                    print(f"Warning: Unrecognized IPv6 peers data length: {len(peers_data)}")
             else:
-                # Announced over IPv4 → expect only IPv4 peers (6-byte stride)
-                if len(peers_data) % 6 != 0:
-                    print("Warning: peers data length not divisible by 6 (IPv4 expected)")
-                peer_list = decode_compact_peers_ipv4(peers_data)
-                ipv4_peers = len(peer_list)
-                ipv4_bytes = len(peers_data)
+                # IPv4 connection - should be IPv4 format
+                if len(peers_data) % 6 == 0:
+                    peer_list = decode_compact_peers_ipv4(peers_data)
+                    ipv4_peers = len(peer_list)
+                    ipv4_bytes = len(peers_data)
+                else:
+                    print(f"Warning: Unrecognized IPv4 peers data length: {len(peers_data)}")
 
         # Small debug output
         if ipv6_peers > 0:
