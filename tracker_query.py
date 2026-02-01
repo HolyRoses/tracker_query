@@ -252,12 +252,12 @@ def format_json_output(data, show_peers=False):
     if not show_peers:
         # Remove peer_list from output if not requested
         data = {k: v for k, v in data.items() if k != 'peer_list'}
-    print("\n" + json.dumps(data, indent=2))
+    print(json.dumps(data, indent=2))
 
 def format_csv_output(data, show_peers=False):
     """Format data as CSV"""
     keys = ['response_time_ms', 'interval', 'min_interval', 'seeds', 'leechers', 'downloaded', 'ipv4_peers', 'ipv6_peers']
-    print("\n" + ",".join(keys))
+    print(",".join(keys))
     print(",".join(str(data.get(k, '?')) for k in keys))
     
     if show_peers and data.get('peer_list'):
@@ -304,11 +304,14 @@ def test_http_tracker(tracker_url, info_hash_hex, event, output_format, show_pee
         sys.exit(2)
 
     url = build_announce_url(tracker_url, info_hash_bytes, event, peer_id, num_want)
-    print(f"\n{'─' * 50}")
-    print(f"HTTP {event.upper()} → {tracker_url}")
-    print(f"{'─' * 50}")
-    print(f"Client: {user_agent}")
-    print(f"URL: {url[:140]}{'...' if len(url) > 140 else ''}")
+
+    # Only print headers for table format (not for json/csv)
+    if output_format == 'table':
+        print(f"\n{'─' * 50}")
+        print(f"HTTP {event.upper()} → {tracker_url}")
+        print(f"{'─' * 50}")
+        print(f"Client: {user_agent}")
+        print(f"URL: {url[:140]}{'...' if len(url) > 140 else ''}")
 
     req = urllib.request.Request(url, headers={'User-Agent': user_agent}, method='GET')
 
@@ -317,23 +320,29 @@ def test_http_tracker(tracker_url, info_hash_hex, event, output_format, show_pee
             response_time_ms = (time.time() - start_time) * 1000
             status = resp.getcode()
             body = resp.read()
-            print(f"Status: {status}   Size: {len(body)} bytes   Response time: {response_time_ms:.2f}ms")
+
+            # Only print status for table format
+            if output_format == 'table':
+                print(f"Status: {status}   Size: {len(body)} bytes   Response time: {response_time_ms:.2f}ms")
 
             if status != 200:
-                print("Non-200 response — tracker likely dead or blocked")
-                if body:
-                    print("Body preview:", body[:200].decode('ascii', errors='replace'))
+                if output_format == 'table':
+                    print("Non-200 response — tracker likely dead or blocked")
+                    if body:
+                        print("Body preview:", body[:200].decode('ascii', errors='replace'))
                 sys.exit(1)
 
             try:
                 decoded = bdecode(body)
                 if not isinstance(decoded, dict):
-                    print("Response is not a bencoded dictionary")
+                    if output_format == 'table':
+                        print("Response is not a bencoded dictionary")
                     sys.exit(1)
 
                 failure = decoded.get(b'failure reason', b'').decode('utf-8', errors='replace')
                 if failure:
-                    print(f"Failure: {failure}")
+                    if output_format == 'table':
+                        print(f"Failure: {failure}")
                     sys.exit(1)
 
                 interval     = decoded.get(b'interval',     '?')
@@ -390,16 +399,19 @@ def test_http_tracker(tracker_url, info_hash_hex, event, output_format, show_pee
                     format_table_output(data, show_peers)
 
             except Exception as e:
-                print(f"Bdecode error: {str(e)}")
-                print("Raw preview (first 160 bytes):")
-                print(body[:160].hex(' ', -1))
+                if output_format == 'table':
+                    print(f"Bdecode error: {str(e)}")
+                    print("Raw preview (first 160 bytes):")
+                    print(body[:160].hex(' ', -1))
                 sys.exit(1)
 
     except urllib.error.HTTPError as e:
-        print(f"HTTP Error: {e.code} {e.reason}")
+        if output_format == 'table':
+            print(f"HTTP Error: {e.code} {e.reason}")
         sys.exit(1)
     except Exception as e:
-        print(f"Request failed: {type(e).__name__}: {str(e)}")
+        if output_format == 'table':
+            print(f"Request failed: {type(e).__name__}: {str(e)}")
         sys.exit(1)
 
     # Return response time for batch mode tracking
@@ -528,17 +540,20 @@ def test_udp_tracker(tracker_url, info_hash_hex, event, output_format, show_peer
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(2)
 
-    print(f"\n{'─' * 50}")
-    print(f"UDP {event.upper()} → {tracker_url}")
-    print(f"{'─' * 50}")
-    print(f"Client: {user_agent}")
-    print(f"Connecting to: {hostname}:{port}")
+    # Only print headers for table format
+    if output_format == 'table':
+        print(f"\n{'─' * 50}")
+        print(f"UDP {event.upper()} → {tracker_url}")
+        print(f"{'─' * 50}")
+        print(f"Client: {user_agent}")
+        print(f"Connecting to: {hostname}:{port}")
 
     # Resolve hostname to determine IP version
     try:
         addr_info = socket.getaddrinfo(hostname, port, socket.AF_UNSPEC, socket.SOCK_DGRAM)
         if not addr_info:
-            print(f"DNS resolution failed: No address found for {hostname}")
+            if output_format == 'table':
+                print(f"DNS resolution failed: No address found for {hostname}")
             sys.exit(1)
 
         # Use the first available address
@@ -547,10 +562,12 @@ def test_udp_tracker(tracker_url, info_hash_hex, event, output_format, show_peer
 
         # Determine if IPv4 or IPv6
         is_ipv6 = family == socket.AF_INET6
-        print(f"Resolved to: {sockaddr[0]} ({'IPv6' if is_ipv6 else 'IPv4'})")
+        if output_format == 'table':
+            print(f"Resolved to: {sockaddr[0]} ({'IPv6' if is_ipv6 else 'IPv4'})")
 
     except socket.gaierror as e:
-        print(f"DNS resolution failed: {e}")
+        if output_format == 'table':
+            print(f"DNS resolution failed: {e}")
         sys.exit(1)
 
     # Create UDP socket with appropriate family
@@ -562,25 +579,31 @@ def test_udp_tracker(tracker_url, info_hash_hex, event, output_format, show_peer
         transaction_id = random.randint(0, 0xFFFFFFFF)
         
         # Step 1: Connect
-        print(f"Sending connect request (transaction_id: {transaction_id})...")
+        if output_format == 'table':
+            print(f"Sending connect request (transaction_id: {transaction_id})...")
         try:
             connection_id = udp_connect(sock, addr, transaction_id)
-            print(f"Connected (connection_id: {connection_id})")
+            if output_format == 'table':
+                print(f"Connected (connection_id: {connection_id})")
         except (TimeoutError, ValueError) as e:
-            print(f"Connect failed: {e}")
+            if output_format == 'table':
+                print(f"Connect failed: {e}")
             sys.exit(1)
         
         # Step 2: Announce
         transaction_id = random.randint(0, 0xFFFFFFFF)
-        print(f"Sending announce request (transaction_id: {transaction_id})...")
+        if output_format == 'table':
+            print(f"Sending announce request (transaction_id: {transaction_id})...")
         try:
             announce_response = udp_announce(sock, addr, connection_id, transaction_id, info_hash_bytes, event, peer_id, num_want)
             response_time_ms = (time.time() - start_time) * 1000
         except (TimeoutError, ValueError) as e:
-            print(f"Announce failed: {e}")
+            if output_format == 'table':
+                print(f"Announce failed: {e}")
             sys.exit(1)
         
-        print(f"Announce successful   Response time: {response_time_ms:.2f}ms")
+        if output_format == 'table':
+            print(f"Announce successful   Response time: {response_time_ms:.2f}ms")
         
         # Decode peers according to the address family we used
         peers_data = announce_response['peers_data']
@@ -598,12 +621,14 @@ def test_udp_tracker(tracker_url, info_hash_hex, event, output_format, show_peer
                     ipv6_peers = len(peer_list)
                     ipv6_bytes = len(peers_data)
                 elif len(peers_data) % 6 == 0:
-                    print("Warning: Connected via IPv6 but received IPv4 peers response")
+                    if output_format == 'table':
+                        print("Warning: Connected via IPv6 but received IPv4 peers response")
                     peer_list = decode_compact_peers_ipv4(peers_data)
                     ipv4_peers = len(peer_list)
                     ipv4_bytes = len(peers_data)
                 else:
-                    print(f"Warning: Unrecognized IPv6 peers data length: {len(peers_data)}")
+                    if output_format == 'table':
+                        print(f"Warning: Unrecognized IPv6 peers data length: {len(peers_data)}")
             else:
                 # IPv4 connection - should be IPv4 format
                 if len(peers_data) % 6 == 0:
@@ -611,22 +636,24 @@ def test_udp_tracker(tracker_url, info_hash_hex, event, output_format, show_peer
                     ipv4_peers = len(peer_list)
                     ipv4_bytes = len(peers_data)
                 else:
-                    print(f"Warning: Unrecognized IPv4 peers data length: {len(peers_data)}")
+                    if output_format == 'table':
+                        print(f"Warning: Unrecognized IPv4 peers data length: {len(peers_data)}")
 
         # Small debug output
-        if ipv6_peers > 0:
-            # Detect IPv4-mapped IPv6 addresses (::ffff:x.x.x.x)
-            # Only seen this behavior from: udp://tracker.theoks.net:6969/announce
-            ipv4_mapped = sum(1 for p in peer_list if p.get('ip', '').startswith('::ffff:'))
-            if ipv4_mapped > 0:
-                native_ipv6 = ipv6_peers - ipv4_mapped
-                print(f"  → Received {ipv6_peers} IPv6 peers ({ipv4_mapped} IPv4-mapped, {native_ipv6} native IPv6)")
-            else:
-                print(f"  → Received {ipv6_peers} IPv6 peers")
-        elif ipv4_peers > 0:
-            print(f"  → Received {ipv4_peers} IPv4 peers")
-        elif len(peers_data) > 0:
-            print(f"  → Received {len(peers_data)} bytes of peers (format unknown)")
+        if output_format == 'table':
+            if ipv6_peers > 0:
+                # Detect IPv4-mapped IPv6 addresses (::ffff:x.x.x.x)
+                # Only seen this behavior from: udp://tracker.theoks.net:6969/announce
+                ipv4_mapped = sum(1 for p in peer_list if p.get('ip', '').startswith('::ffff:'))
+                if ipv4_mapped > 0:
+                    native_ipv6 = ipv6_peers - ipv4_mapped
+                    print(f"  → Received {ipv6_peers} IPv6 peers ({ipv4_mapped} IPv4-mapped, {native_ipv6} native IPv6)")
+                else:
+                    print(f"  → Received {ipv6_peers} IPv6 peers")
+            elif ipv4_peers > 0:
+                print(f"  → Received {ipv4_peers} IPv4 peers")
+            elif len(peers_data) > 0:
+                print(f"  → Received {len(peers_data)} bytes of peers (format unknown)")
 
         total_peers_returned = len(peer_list)
 
