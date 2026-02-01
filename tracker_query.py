@@ -161,7 +161,11 @@ def decode_compact_peers_ipv6(data):
         
         ip = socket.inet_ntop(socket.AF_INET6, ip_bytes)
         port = struct.unpack('!H', port_bytes)[0]
-        peers.append({'ip': ip, 'port': port, 'type': 'ipv6'})
+
+        # Detect IPv4-mapped IPv6 addresses (::ffff:x.x.x.x)
+        peer_type = 'ipv4-mapped' if ip.startswith('::ffff:') else 'ipv6'
+
+        peers.append({'ip': ip, 'port': port, 'type': peer_type})
     
     return peers
 
