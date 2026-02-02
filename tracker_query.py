@@ -224,6 +224,26 @@ def format_table_output(data, show_peers=False):
     else:
         print(f"Response Time:     {'N/A':>10}")
 
+    # Display warning message if present
+    # example Warning using http://nyaa.tracker.wf:7777/announce
+    if data.get('warning_message'):
+        print(f"{YELLOW}⚠ Warning:         {data['warning_message']}{NC}")
+
+    # Display failure reason if present
+    # example Failure using http://ch3oh.ru:6969/announce
+    if data.get('failure_reason'):
+        print(f"{RED}✗ Failure:         {data['failure_reason']}{NC}")
+
+    # Display external IP if present (BEP 24)
+    # Currently supported @ http://tracker.skyts.net:6969/announce
+    if data.get('external_ip'):
+        print(f"External IP:       {data['external_ip']}")
+
+    # Display tracker ID if present
+    # Currently supported @ http://tracker.skyts.net:6969/announce
+    if data.get('tracker_id'):
+        print(f"Tracker ID:        {data['tracker_id']}")
+
     print(f"Interval:          {data['interval']:>10} s")
     print(f"Min Interval:      {data['min_interval']:>10} s")
     print(f"Seeds:             {data['seeds']:>10}")
@@ -260,7 +280,8 @@ def format_json_output(data, show_peers=False):
 
 def format_csv_output(data, show_peers=False):
     """Format data as CSV"""
-    keys = ['response_time_ms', 'interval', 'min_interval', 'seeds', 'leechers', 'downloaded', 'ipv4_peers', 'ipv6_peers']
+    keys = ['tracker', 'response_time_ms', 'interval', 'min_interval', 'seeds', 'leechers', 'downloaded',
+            'ipv4_peers', 'ipv6_peers', 'warning_message', 'failure_reason', 'external_ip', 'tracker_id']
     print(",".join(keys))
     print(",".join(str(data.get(k, '?')) for k in keys))
     
@@ -343,11 +364,37 @@ def test_http_tracker(tracker_url, info_hash_hex, event, output_format, show_pee
                         print("Response is not a bencoded dictionary")
                     sys.exit(1)
 
-                failure = decoded.get(b'failure reason', b'').decode('utf-8', errors='replace')
-                if failure:
-                    if output_format == 'table':
-                        print(f"Failure: {failure}")
-                    sys.exit(1)
+                # Extract failure reason if present (normalized naming)
+                failure_reason = decoded.get(b'failure reason', b'').decode('utf-8', errors='replace')
+                if not failure_reason:
+                    failure_reason = None
+
+                # Extract warning message if present (normalized naming)
+                warning_message = decoded.get(b'warning message', b'').decode('utf-8', errors='replace')
+                if not warning_message:
+                    warning_message = None
+
+                # Extract external IP if present (BEP 24)
+                # BEP 24: IPv4 = 32-bit binary (4 bytes), IPv6 = 128-bit binary (16 bytes)
+                external_ip = decoded.get(b'external ip', b'')
+                if isinstance(external_ip, bytes) and len(external_ip) == 4:
+                    # IPv4: 32-bit binary
+                    external_ip = socket.inet_ntoa(external_ip)
+                elif isinstance(external_ip, bytes) and len(external_ip) == 16:
+                    # IPv6: 128-bit binary
+                    external_ip = socket.inet_ntop(socket.AF_INET6, external_ip)
+                elif isinstance(external_ip, bytes) and len(external_ip) > 0:
+                    # Non-standard: try decoding as string (shouldn't happen per BEP 24)
+                    external_ip = external_ip.decode('utf-8', errors='replace')
+                else:
+                    external_ip = None
+
+                # Extract tracker ID if present
+                tracker_id = decoded.get(b'tracker id', b'')
+                if isinstance(tracker_id, bytes):
+                    tracker_id = tracker_id.decode('utf-8', errors='replace')
+                if not tracker_id:
+                    tracker_id = None
 
                 interval     = decoded.get(b'interval',     '?')
                 min_int      = decoded.get(b'min interval', '?')
@@ -380,6 +427,7 @@ def test_http_tracker(tracker_url, info_hash_hex, event, output_format, show_pee
                 total_peers_returned = len(peer_list)
 
                 data = {
+                    'tracker': tracker_url,
                     'interval': interval,
                     'min_interval': min_int,
                     'seeds': seeds,
@@ -392,7 +440,11 @@ def test_http_tracker(tracker_url, info_hash_hex, event, output_format, show_pee
                     'peer_list': peer_list,
                     'num_want_requested': num_want,
                     'total_peers_returned': total_peers_returned,
-                    'response_time_ms': round(response_time_ms, 2)
+                    'response_time_ms': round(response_time_ms, 2),
+                    'warning_message': warning_message,
+                    'failure_reason': failure_reason,
+                    'external_ip': external_ip,
+                    'tracker_id': tracker_id
                 }
 
                 if output_format == 'json':
@@ -401,6 +453,10 @@ def test_http_tracker(tracker_url, info_hash_hex, event, output_format, show_pee
                     format_csv_output(data, show_peers)
                 else:  # table
                     format_table_output(data, show_peers)
+
+                # Exit with error if there was a failure reason
+                if failure_reason:
+                    sys.exit(1)
 
             except Exception as e:
                 if output_format == 'table':
@@ -662,6 +718,7 @@ def test_udp_tracker(tracker_url, info_hash_hex, event, output_format, show_peer
         total_peers_returned = len(peer_list)
 
         data = {
+            'tracker': tracker_url,
             'interval': announce_response['interval'],
             'min_interval': announce_response['interval'],  # UDP has no min_interval
             'seeds': announce_response['seeders'],
@@ -674,7 +731,11 @@ def test_udp_tracker(tracker_url, info_hash_hex, event, output_format, show_peer
             'peer_list': peer_list,
             'num_want_requested': num_want,
             'total_peers_returned': total_peers_returned,
-            'response_time_ms': round(response_time_ms, 2)
+            'response_time_ms': round(response_time_ms, 2),
+            'warning_message': None,  # UDP doesn't support warning messages
+            'failure_reason': None,    # UDP doesn't support failure reasons (uses error action instead)
+            'external_ip': None,       # UDP doesn't support external IP in standard protocol
+            'tracker_id': None         # UDP doesn't support tracker ID
         }
 
         if output_format == 'json':
