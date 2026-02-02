@@ -166,7 +166,7 @@ def decode_compact_peers_ipv6(data):
         peer_type = 'ipv4-mapped' if ip.startswith('::ffff:') else 'ipv6'
 
         peers.append({'ip': ip, 'port': port, 'type': peer_type})
-    
+
     return peers
 
 def decode_dict_peers(peer_list):
@@ -182,7 +182,7 @@ def decode_dict_peers(peer_list):
             if peer_id:
                 peer_info['peer_id'] = peer_id.hex()
             peers.append(peer_info)
-    
+
     return peers
 
 # ────────────────────────────────────────────────
@@ -197,11 +197,11 @@ def format_table_output(data, show_peers=False):
     YELLOW = '\033[1;33m'
     RED = '\033[0;31m'
     NC = '\033[0m'  # No Color
-    
+
     # Skip colors if not in batch mode or if nocolor flag is set
     if not data.get('batch_mode') or NOCOLOR:
         BRIGHT_GREEN = GREEN = YELLOW = RED = NC = ''
-    
+
     print("\nTracker Response Summary:")
     print("─" * 50)
 
@@ -235,7 +235,8 @@ def format_table_output(data, show_peers=False):
         print(f"{RED}✗ Failure:         {data['failure_reason']}{NC}")
 
     # Display external IP if present (BEP 24)
-    # Currently supported @ http://tracker.skyts.net:6969/announce
+    # IPv4 reply from http://tracker.skyts.net:6969/announce
+    # IPv6 reply from http://tracker.ghostchu-services.top:80/announce
     if data.get('external_ip'):
         print(f"External IP:       {data['external_ip']}")
 
@@ -262,7 +263,7 @@ def format_table_output(data, show_peers=False):
             print(f"Requested:         {requested:>10} peers (respected)")
 
     print("─" * 50)
-    
+
     if show_peers and data.get('peer_list'):
         print("\nPeer List:")
         print("─" * 50)
