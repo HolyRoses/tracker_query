@@ -5,7 +5,7 @@ Tracker announce tester – Synology DSM compatible (no external modules)
 Queries a BitTorrent tracker announce endpoint and shows
 seeds / leechers / peer counts from the bencoded response.
 
-Supports both HTTP/HTTPS and UDP trackers.
+Supports both HTTP/HTTPS and UDP trackers, as well as scrape requests.
 
 Examples:
   ./tracker_test.py --tracker http://open.acgtracker.com:1096/announce
@@ -13,6 +13,8 @@ Examples:
   ./tracker_test.py -t http://tracker.example.com/announce --event completed
   ./tracker_test.py --tracker udp://tracker2.com:6969 --hash deadbeef... --event started
   ./tracker_test.py -t http://tracker.example.com/announce --format json --show-peers
+  ./tracker_test.py -t http://tracker.example.com/announce --scrape
+  ./tracker_test.py -t http://tracker.example.com/announce --scrape --hash deadbeef...
 """
 
 import sys
@@ -36,7 +38,7 @@ import os
 NOCOLOR = False
 
 DEFAULT_INFO_HASH_HEX = '5CB6C44712D494A87E8554839FB0541046B157AF'
-DEFAULT_TRACKER       = 'udp://open.stealth.si:80/announce'
+DEFAULT_TRACKER       = 'http://lucke.fenesisu.moe:6969/announce'
 DEFAULT_PEER_ID       = b'-qB5140-' + os.urandom(12)
 DEFAULT_USER_AGENT    = "qBittorrent/5.1.4"
 DEFAULT_TIMEOUT       = 12
@@ -93,6 +95,62 @@ def get_random_qb_client():
     user_agent = f"qBittorrent/{version}"
     peer_id = f"-qB{code}-".encode('ascii') + os.urandom(12)
     return user_agent, peer_id
+
+# ────────────────────────────────────────────────────
+# Scrape URL conversion
+# ────────────────────────────────────────────────────
+
+def convert_announce_to_scrape(announce_url):
+    """
+    Convert an announce URL to a scrape URL following the BitTorrent scrape convention.
+
+    Returns (scrape_url, error_message) tuple.
+    If conversion fails, scrape_url is None and error_message explains why.
+    """
+    # Parse the URL
+    parsed = urllib.parse.urlparse(announce_url)
+
+    # Scrape only works with HTTP/HTTPS
+    if parsed.scheme not in ('http', 'https'):
+        return None, "Scrape is only supported for HTTP/HTTPS trackers"
+
+    # Find the last '/' in the path
+    path = parsed.path
+    if not path or path == '/':
+        return None, "Invalid announce URL: no path component"
+
+    last_slash_idx = path.rfind('/')
+    if last_slash_idx == -1:
+        return None, "Invalid announce URL: no '/' found in path"
+
+    # Get the part after the last '/'
+    after_slash = path[last_slash_idx + 1:]
+
+    # Check if it starts with 'announce'
+    if not after_slash.startswith('announce'):
+        return None, f"Scrape not supported: path doesn't contain 'announce' after last '/' (found '{after_slash}')"
+
+    # Check for entity quoting issues that would prevent scrape support
+    # The path before the last slash should not contain encoded slashes or the word 'announce'
+    before_last_slash = path[:last_slash_idx]
+    if '%06' in before_last_slash and '4' in before_last_slash:  # checking for %064 pattern
+        return None, "Scrape not supported: encoded characters in path before 'announce'"
+
+    # Replace 'announce' with 'scrape'
+    scrape_component = 'scrape' + after_slash[len('announce'):]
+    scrape_path = path[:last_slash_idx + 1] + scrape_component
+
+    # Reconstruct the URL
+    scrape_url = urllib.parse.urlunparse((
+        parsed.scheme,
+        parsed.netloc,
+        scrape_path,
+        parsed.params,
+        parsed.query,  # Keep original query params
+        parsed.fragment
+    ))
+
+    return scrape_url, None
 
 # ────────────────────────────────────────────────
 # Simple bencode decoder
@@ -292,6 +350,67 @@ def format_csv_output(data, show_peers=False):
             peer_id = peer.get('peer_id', '')
             print(f"{peer['ip']},{peer['port']},{peer['type']},{peer_id}")
 
+def format_scrape_table_output(data):
+    """Format scrape data as a clean aligned table"""
+    # Color codes for batch mode
+    BRIGHT_GREEN = '\033[1;32m'
+    GREEN = '\033[0;32m'
+    YELLOW = '\033[1;33m'
+    RED = '\033[0;31m'
+    NC = '\033[0m'  # No Color
+
+    # Skip colors if not in batch mode or if nocolor flag is set
+    if not data.get('batch_mode') or NOCOLOR:
+        BRIGHT_GREEN = GREEN = YELLOW = RED = NC = ''
+
+    print("\nScrape Response Summary:")
+    print("─" * 50)
+
+    # Display response time with color coding
+    response_time = data.get('response_time_ms')
+    if response_time is not None:
+        if response_time < 150:
+            color = BRIGHT_GREEN
+            speed = "Excellent"
+        elif response_time < 300:
+            color = GREEN
+            speed = "Good"
+        elif response_time < 500:
+            color = YELLOW
+            speed = "OK"
+        else:
+            color = RED
+            speed = "Slow"
+        print(f"Response Time:     {color}{response_time:>10.2f} ms ({speed}){NC}")
+    else:
+        print(f"Response Time:     {'N/A':>10}")
+
+    # Display failure reason if present
+    if data.get('failure_reason'):
+        print(f"{RED}✗ Failure:         {data['failure_reason']}{NC}")
+
+    # Display min_request_interval if present (unofficial extension)
+    # Example return data from http://1337.abcvg.info:80/announce or http://ftp.pet:6969/announce
+    if data.get('min_request_interval'):
+        print(f"Min Request Int:   {data['min_request_interval']:>10} s")
+
+    print(f"Torrents Found:    {data['torrent_count']:>10}")
+    print("─" * 50)
+
+    # Display torrents
+    if data.get('torrents'):
+        print("\nTorrent Statistics:")
+        print("─" * 50)
+        for i, torrent in enumerate(data['torrents'], 1):
+            print(f"\nTorrent #{i}:")
+            print(f"  Info Hash:       {torrent['info_hash']}")
+            if torrent.get('name'):
+                print(f"  Name:            {torrent['name']}")
+            print(f"  Seeds (complete):      {torrent['complete']:>5}")
+            print(f"  Leechers (incomplete): {torrent['incomplete']:>5}")
+            print(f"  Times Downloaded:      {torrent['downloaded']:>5}")
+        print("─" * 50)
+
 # ────────────────────────────────────────────────
 # HTTP Tracker Functions
 # ────────────────────────────────────────────────
@@ -478,9 +597,181 @@ def test_http_tracker(tracker_url, info_hash_hex, event, output_format, show_pee
     # Return response time for batch mode tracking
     return round(response_time_ms, 2) if 'response_time_ms' in locals() else None
 
-# ────────────────────────────────────────────────
-# UDP Tracker Functions
-# ────────────────────────────────────────────────
+def test_http_scrape(tracker_url, info_hash_hex, output_format, show_peers, user_agent):
+    """Test HTTP/HTTPS tracker scrape endpoint and return response time in milliseconds
+
+    info_hash_hex can be:
+    - A single hex string
+    - A list of hex strings (for multi-hash scrape)
+    """
+    start_time = time.time()
+
+    # Convert announce URL to scrape URL
+    scrape_url, error = convert_announce_to_scrape(tracker_url)
+    if error:
+        print(f"Error: {error}", file=sys.stderr)
+        sys.exit(2)
+
+    # Handle single hash or multiple hashes
+    if isinstance(info_hash_hex, list):
+        # Multiple hashes
+        info_hash_list = []
+        for hash_hex in info_hash_hex:
+            try:
+                hash_bytes = bytes.fromhex(hash_hex)
+                if len(hash_bytes) != 20:
+                    raise ValueError(f"Info hash must be exactly 40 hex characters (20 bytes): {hash_hex}")
+                info_hash_list.append(hash_bytes)
+            except ValueError as e:
+                print(f"Error: Invalid info hash — {e}", file=sys.stderr)
+                sys.exit(2)
+    else:
+        # Single hash
+        try:
+            info_hash_bytes = bytes.fromhex(info_hash_hex)
+            if len(info_hash_bytes) != 20:
+                raise ValueError("Info hash must be exactly 40 hex characters (20 bytes)")
+            info_hash_list = [info_hash_bytes]
+        except ValueError as e:
+            print(f"Error: Invalid info hash — {e}", file=sys.stderr)
+            sys.exit(2)
+
+    # Build scrape URL with info_hash parameter(s)
+    # Build query string with multiple info_hash params if needed
+    params_list = []
+    for hash_bytes in info_hash_list:
+        params = {'info_hash': hash_bytes}
+        params_list.append(urllib.parse.urlencode(params, doseq=False, safe='~'))
+
+    # Join with & for multiple hashes
+    query_string = '&'.join(params_list)
+
+    # Check if scrape_url already has query params
+    separator = '&' if '?' in scrape_url else '?'
+    full_url = f"{scrape_url}{separator}{query_string}"
+
+    # Only print headers for table format (not for json/csv)
+    if output_format == 'table':
+        print(f"\n{'─' * 50}")
+        print(f"HTTP SCRAPE → {tracker_url}")
+        print(f"{'─' * 50}")
+        print(f"Client: {user_agent}")
+        hash_count = len(info_hash_list)
+        print(f"Scraping {hash_count} torrent{'s' if hash_count > 1 else ''}")
+        print(f"Scrape URL: {full_url[:120]}{'...' if len(full_url) > 120 else ''}")
+
+    req = urllib.request.Request(full_url, headers={'User-Agent': user_agent}, method='GET')
+
+    try:
+        with urllib.request.urlopen(req, timeout=DEFAULT_TIMEOUT) as resp:
+            response_time_ms = (time.time() - start_time) * 1000
+            status = resp.getcode()
+            body = resp.read()
+
+            # Check for gzip compression
+            content_encoding = resp.getheader('Content-Encoding', '')
+            if 'gzip' in content_encoding.lower():
+                import gzip
+                body = gzip.decompress(body)
+
+            # Only print status for table format
+            if output_format == 'table':
+                print(f"Status: {status}   Size: {len(body)} bytes   Response time: {response_time_ms:.2f}ms")
+
+            if status != 200:
+                if output_format == 'table':
+                    print("Non-200 response — tracker likely dead or blocked")
+                    if body:
+                        print("Body preview:", body[:200].decode('ascii', errors='replace'))
+                sys.exit(1)
+
+            try:
+                decoded = bdecode(body)
+                if not isinstance(decoded, dict):
+                    if output_format == 'table':
+                        print("Response is not a bencoded dictionary")
+                    sys.exit(1)
+
+                # Extract failure reason if present (unofficial extension)
+                failure_reason = decoded.get(b'failure reason', b'').decode('utf-8', errors='replace')
+                if not failure_reason:
+                    failure_reason = None
+
+                # Extract flags dictionary (unofficial extension)
+                flags = decoded.get(b'flags', {})
+                min_request_interval = None
+                if isinstance(flags, dict):
+                    min_request_interval = flags.get(b'min_request_interval')
+
+                # Extract files dictionary
+                files = decoded.get(b'files', {})
+
+                # Process each torrent in the scrape response
+                torrents = []
+                if isinstance(files, dict):
+                    for info_hash_raw, stats in files.items():
+                        if isinstance(stats, dict):
+                            torrent_data = {
+                                'info_hash': info_hash_raw.hex() if isinstance(info_hash_raw, bytes) else str(info_hash_raw),
+                                'complete': stats.get(b'complete', 0),
+                                'incomplete': stats.get(b'incomplete', 0),
+                                'downloaded': stats.get(b'downloaded', 0),
+                            }
+
+                            # Extract optional name field
+                            name = stats.get(b'name', b'')
+                            if isinstance(name, bytes):
+                                torrent_data['name'] = name.decode('utf-8', errors='replace')
+                            elif name:
+                                torrent_data['name'] = str(name)
+
+                            torrents.append(torrent_data)
+
+                data = {
+                    'tracker': tracker_url,
+                    'scrape_url': scrape_url,
+                    'response_time_ms': round(response_time_ms, 2),
+                    'failure_reason': failure_reason,
+                    'min_request_interval': min_request_interval,
+                    'torrents': torrents,
+                    'torrent_count': len(torrents)
+                }
+
+                if output_format == 'json':
+                    print(json.dumps(data, indent=2))
+                elif output_format == 'csv':
+                    # CSV header
+                    print("info_hash,complete,incomplete,downloaded,name")
+                    for torrent in torrents:
+                        name = torrent.get('name', '')
+                        # Escape commas in name
+                        name = name.replace(',', ';')
+                        print(f"{torrent['info_hash']},{torrent['complete']},{torrent['incomplete']},{torrent['downloaded']},{name}")
+                else:  # table
+                    format_scrape_table_output(data)
+
+                # Exit with error if there was a failure reason
+                if failure_reason:
+                    sys.exit(1)
+
+            except Exception as e:
+                if output_format == 'table':
+                    print(f"Bdecode error: {str(e)}")
+                    print("Raw preview (first 160 bytes):")
+                    print(body[:160].hex(' ', -1))
+                sys.exit(1)
+
+    except urllib.error.HTTPError as e:
+        if output_format == 'table':
+            print(f"HTTP Error: {e.code} {e.reason}")
+        sys.exit(1)
+    except Exception as e:
+        if output_format == 'table':
+            print(f"Request failed: {type(e).__name__}: {str(e)}")
+        sys.exit(1)
+
+    # Return response time for batch mode tracking
+    return round(response_time_ms, 2) if 'response_time_ms' in locals() else None
 
 def parse_udp_url(tracker_url):
     """Parse UDP tracker URL and return (hostname, port)"""
@@ -756,10 +1047,10 @@ def test_udp_tracker(tracker_url, info_hash_hex, event, output_format, show_peer
 # Main dispatcher
 # ────────────────────────────────────────────────
 
-def test_tracker(tracker_url, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want):
+def test_tracker(tracker_url, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want, scrape=False):
     """Route to HTTP or UDP tracker based on URL scheme (returns (success, response_time) for batch mode)"""
     try:
-        response_time = _test_tracker_impl(tracker_url, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want)
+        response_time = _test_tracker_impl(tracker_url, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want, scrape)
         return True, response_time
     except SystemExit as e:
         # Catch sys.exit() calls and convert to return value
@@ -768,14 +1059,20 @@ def test_tracker(tracker_url, info_hash_hex, event, output_format, show_peers, u
         print(f"Error: {e}", file=sys.stderr)
         return False, None
 
-def _test_tracker_impl(tracker_url, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want):
+def _test_tracker_impl(tracker_url, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want, scrape=False):
     """Internal implementation - routes to HTTP or UDP tracker based on URL scheme, returns response_time"""
     parsed = urllib.parse.urlparse(tracker_url)
     scheme = parsed.scheme.lower()
     
     if scheme in ('http', 'https'):
-        return test_http_tracker(tracker_url, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want)
+        if scrape:
+            return test_http_scrape(tracker_url, info_hash_hex, output_format, show_peers, user_agent)
+        else:
+            return test_http_tracker(tracker_url, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want)
     elif scheme == 'udp':
+        if scrape:
+            print("Error: Scrape is only supported for HTTP/HTTPS trackers, not UDP.", file=sys.stderr)
+            sys.exit(2)
         return test_udp_tracker(tracker_url, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want)
     else:
         print(f"Error: Unsupported tracker scheme '{scheme}'. Only http, https, and udp are supported.", file=sys.stderr)
@@ -785,7 +1082,7 @@ def _test_tracker_impl(tracker_url, info_hash_hex, event, output_format, show_pe
 # Batch mode functionality
 # ────────────────────────────────────────────────
 
-def batch_query_trackers(tracker_file, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want, delay, random_qb):
+def batch_query_trackers(tracker_file, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want, delay, random_qb, scrape=False):
     """Query multiple trackers from a file"""
     # Color codes
     RED = '\033[0;31m'
@@ -824,15 +1121,16 @@ def batch_query_trackers(tracker_file, info_hash_hex, event, output_format, show
 
     # Header
     print(f"{BLUE}{'=' * 40}{NC}")
-    print(f"{BLUE}Batch Tracker Query{NC}")
+    print(f"{BLUE}Batch Tracker {'Scrape' if scrape else 'Query'}{NC}")
     print(f"{BLUE}{'=' * 40}{NC}")
     print(f"Tracker file: {GREEN}{tracker_file}{NC}")
     print(f"Total trackers: {GREEN}{total}{NC}")
-    print(f"Event: {GREEN}{event}{NC}")
-    print(f"Show peers: {GREEN}{show_peers}{NC}")
-    print(f"Num want: {GREEN}{num_want}{NC}")
+    if not scrape:
+        print(f"Event: {GREEN}{event}{NC}")
+        print(f"Show peers: {GREEN}{show_peers}{NC}")
+        print(f"Num want: {GREEN}{num_want}{NC}")
     print(f"Delay: {GREEN}{delay}s{NC}")
-    print(f"Info hash: {GREEN}{info_hash_hex}{NC}")
+    print(f"Info hash: {GREEN}{info_hash_hex if info_hash_hex else 'All torrents'}{NC}")
     print(f"{BLUE}{'=' * 40}{NC}\n")
 
     # Statistics
@@ -844,7 +1142,7 @@ def batch_query_trackers(tracker_file, info_hash_hex, event, output_format, show
 
     # Query each tracker
     for i, tracker in enumerate(trackers, 1):
-        print(f"\n{BLUE}[{i}/{total}]{NC} Querying tracker...")
+        print(f"\n{BLUE}[{i}/{total}]{NC} {'Scraping' if scrape else 'Querying'} tracker...")
         print(f"{YELLOW}{tracker}{NC}")
         print("")
 
@@ -853,7 +1151,7 @@ def batch_query_trackers(tracker_file, info_hash_hex, event, output_format, show
             user_agent, peer_id = get_random_qb_client()
 
         # Query the tracker - use table format always in batch mode
-        success, response_time = test_tracker(tracker, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want)
+        success, response_time = test_tracker(tracker, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want, scrape)
 
         if success:
             success_count += 1
@@ -930,7 +1228,7 @@ def batch_query_trackers(tracker_file, info_hash_hex, event, output_format, show
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Query a BitTorrent tracker announce endpoint and display swarm info (seeds, leechers, peers). Supports HTTP/HTTPS and UDP trackers.",
+        description="Query a BitTorrent tracker announce endpoint and display swarm info (seeds, leechers, peers). Supports HTTP/HTTPS and UDP trackers, as well as HTTP/HTTPS scrape requests.",
         formatter_class=lambda prog: argparse.ArgumentDefaultsHelpFormatter(prog, max_help_position=32),
         add_help=True
     )
@@ -951,8 +1249,12 @@ def main():
     parser.add_argument(
         '-H', '--hash',
         metavar='HEX',
-        default=DEFAULT_INFO_HASH_HEX,
-        help="Info hash (40 hex characters)"
+        action='append',
+        default=argparse.SUPPRESS,  # Don't show the automatic (default: ...)
+        help=(
+            "Info hash (40 hex characters). Can be specified multiple times for scrape mode. "
+            f"(default: {DEFAULT_INFO_HASH_HEX})"
+        )
     )
 
     parser.add_argument(
@@ -960,7 +1262,7 @@ def main():
         metavar='EVENT',
         choices=['started', 'completed', 'stopped', 'none'],
         default=DEFAULT_EVENT,
-        help="Announce event type (choices: started, completed, stopped, none)"
+        help="Announce event type (choices: started, completed, stopped, none). Ignored in scrape mode."
     )
 
     parser.add_argument(
@@ -981,7 +1283,7 @@ def main():
     parser.add_argument(
         '-p', '--show-peers',
         action='store_true',
-        help="Display the full list of peers (IP:port)"
+        help="Display the full list of peers (IP:port). Only applies to announce mode."
     )
 
     parser.add_argument(
@@ -995,7 +1297,7 @@ def main():
         metavar='NUM',
         type=int,
         default=DEFAULT_NUM_WANT,
-        help="Number of peers to request from tracker"
+        help="Number of peers to request from tracker. Ignored in scrape mode."
     )
 
     parser.add_argument(
@@ -1012,11 +1314,31 @@ def main():
         help="Disable colored output (useful for redirecting to files)"
     )
 
+    parser.add_argument(
+        '-s', '--scrape',
+        action='store_true',
+        help="Use scrape endpoint instead of announce. Only works with HTTP/HTTPS trackers."
+    )
+
     args = parser.parse_args()
 
     # Set global NOCOLOR flag
     global NOCOLOR
     NOCOLOR = args.nocolor
+
+    # Handle hash argument - can be list (from append) or None
+    if args.hash is None or len(args.hash) == 0:
+        # No hash provided - use default
+        info_hash = DEFAULT_INFO_HASH_HEX
+    elif len(args.hash) == 1:
+        # Single hash provided
+        info_hash = args.hash[0]
+    else:
+        # Multiple hashes provided (only valid for scrape)
+        if not args.scrape:
+            print("Error: Multiple --hash arguments are only supported in scrape mode", file=sys.stderr)
+            sys.exit(2)
+        info_hash = args.hash  # Keep as list for scrape
 
     # Determine client info
     if args.random_qb:
@@ -1027,10 +1349,10 @@ def main():
 
     # Run batch or single mode
     if args.batch:
-        batch_query_trackers(args.file, args.hash, args.event, args.format, args.show_peers, user_agent, peer_id, args.num_want, args.delay, args.random_qb)
+        batch_query_trackers(args.file, info_hash, args.event, args.format, args.show_peers, user_agent, peer_id, args.num_want, args.delay, args.random_qb, args.scrape)
     else:
         # Single tracker mode
-        success, response_time = test_tracker(args.tracker, args.hash, args.event, args.format, args.show_peers, user_agent, peer_id, args.num_want)
+        success, response_time = test_tracker(args.tracker, info_hash, args.event, args.format, args.show_peers, user_agent, peer_id, args.num_want, args.scrape)
         sys.exit(0 if success else 1)
 
 if __name__ == '__main__':

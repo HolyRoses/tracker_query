@@ -1,16 +1,18 @@
-usage: tracker_query.py [-h] [-b] [-t URL] [-H HEX] [-e EVENT] [-o FORMAT] [-f FILE] [-p] [-r] [-n NUM] [-d SECONDS]
+usage: tracker_query.py [-h] [-b] [-t URL] [-H HEX] [-e EVENT] [-o FORMAT] [-f FILE] [-p] [-r] [-n NUM] [-d SECONDS] [--nocolor] [-s]
 
-Query a BitTorrent tracker announce endpoint and display swarm info (seeds, leechers, peers). Supports HTTP/HTTPS and UDP trackers.
+Query a BitTorrent tracker announce endpoint and display swarm info (seeds, leechers, peers). Supports HTTP/HTTPS and UDP trackers, as well as HTTP/HTTPS scrape requests.
 
 optional arguments:
   -h, --help                   show this help message and exit
   -b, --batch                  Enable batch mode to query multiple trackers from a file (ignores --tracker) (default: False)
-  -t URL, --tracker URL        Tracker announce URL (http://, https://, or udp://). Ignored in batch mode. (default: udp://open.stealth.si:80/announce)
-  -H HEX, --hash HEX           Info hash (40 hex characters) (default: 5CB6C44712D494A87E8554839FB0541046B157AF)
-  -e EVENT, --event EVENT      Announce event type (default: started)
+  -t URL, --tracker URL        Tracker announce URL (http://, https://, or udp://). Ignored in batch mode. (default: http://lucke.fenesisu.moe:6969/announce)
+  -H HEX, --hash HEX           Info hash (40 hex characters). Can be specified multiple times for scrape mode. (default: 5CB6C44712D494A87E8554839FB0541046B157AF)
+  -e EVENT, --event EVENT      Announce event type (choices: started, completed, stopped, none). Ignored in scrape mode. (default: started)
   -o FORMAT, --format FORMAT   Output format: table, json, or csv. (default: table)
   -f FILE, --file FILE         Tracker list file for batch mode (one tracker URL per line, # for comments) (default: trackers_to_query.txt)
-  -p, --show-peers             Display the full list of peers (IP:port) (default: False)
+  -p, --show-peers             Display the full list of peers (IP:port). Only applies to announce mode. (default: False)
   -r, --random-qb              Use a random qBittorrent client version for the announce (spoofs User-Agent and peer_id) (default: False)
-  -n NUM, --num-want NUM       Number of peers to request from tracker (default: 50)
+  -n NUM, --num-want NUM       Number of peers to request from tracker. Ignored in scrape mode. (default: 50)
   -d SECONDS, --delay SECONDS  Delay between queries in batch mode (in seconds). Ignored in single-tracker mode. (default: 1.0)
+  --nocolor                    Disable colored output (useful for redirecting to files) (default: False)
+  -s, --scrape                 Use scrape endpoint instead of announce. Only works with HTTP/HTTPS trackers. (default: False)
