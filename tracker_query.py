@@ -1249,12 +1249,8 @@ def main():
     parser.add_argument(
         '-H', '--hash',
         metavar='HEX',
-        action='append',
-        default=argparse.SUPPRESS,  # Don't show the automatic (default: ...)
-        help=(
-            "Info hash (40 hex characters). Can be specified multiple times for scrape mode. "
-            f"(default: {DEFAULT_INFO_HASH_HEX})"
-        )
+        action='append',  # Allow multiple -H arguments
+        help="Info hash (40 hex characters). Can be specified multiple times for scrape mode to query multiple torrents."
     )
 
     parser.add_argument(

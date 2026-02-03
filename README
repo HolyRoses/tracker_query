@@ -6,7 +6,7 @@ optional arguments:
   -h, --help                   show this help message and exit
   -b, --batch                  Enable batch mode to query multiple trackers from a file (ignores --tracker) (default: False)
   -t URL, --tracker URL        Tracker announce URL (http://, https://, or udp://). Ignored in batch mode. (default: http://lucke.fenesisu.moe:6969/announce)
-  -H HEX, --hash HEX           Info hash (40 hex characters). Can be specified multiple times for scrape mode. (default: 5CB6C44712D494A87E8554839FB0541046B157AF)
+  -H HEX, --hash HEX           Info hash (40 hex characters). Can be specified multiple times for scrape mode to query multiple torrents. (default: None)
   -e EVENT, --event EVENT      Announce event type (choices: started, completed, stopped, none). Ignored in scrape mode. (default: started)
   -o FORMAT, --format FORMAT   Output format: table, json, or csv. (default: table)
   -f FILE, --file FILE         Tracker list file for batch mode (one tracker URL per line, # for comments) (default: trackers_to_query.txt)
