@@ -1,4 +1,4 @@
-usage: tracker_query.py [-h] [-b] [-t URL] [-H HEX] [-e EVENT] [-o FORMAT] [-f FILE] [-p] [-l] [-r] [-n NUM] [-d SECONDS] [--nocolor] [-s]
+usage: tracker_query.py [-h] [-b] [-t URL] [-H HEX] [-e EVENT] [-o FORMAT] [-f FILE] [-p] [-l] [-r] [-n NUM] [-d SECONDS] [--nocolor] [-s] [--redial [COUNT]]
 
 Query a BitTorrent tracker announce endpoint and display swarm info (seeds, leechers, peers). Supports HTTP/HTTPS and UDP trackers, as well as HTTP/HTTPS scrape requests.
 
@@ -17,3 +17,4 @@ optional arguments:
   -d SECONDS, --delay SECONDS  Delay between queries in batch mode (in seconds). Ignored in single-tracker mode. (default: 1.0)
   --nocolor                    Disable colored output (useful for redirecting to files) (default: False)
   -s, --scrape                 Use scrape endpoint instead of announce. Only works with HTTP/HTTPS trackers. (default: False)
+  --redial [COUNT]             Retry connection until successful. Specify COUNT for max attempts (e.g., --redial 5), or omit for infinite retries (e.g., --redial). Only works in single-tracker mode. (default: None)

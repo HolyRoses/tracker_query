@@ -16,6 +16,8 @@ Examples:
   ./tracker_test.py -t http://tracker.example.com/announce --show-peers --lookup
   ./tracker_test.py -t http://tracker.example.com/announce --scrape
   ./tracker_test.py -t http://tracker.example.com/announce --scrape --hash deadbeef...
+  ./tracker_test.py -t udp://flaky.tracker.com:1337/announce --redial
+  ./tracker_test.py -t http://tracker.example.com/announce --redial 5
 """
 
 import sys
@@ -1284,6 +1286,59 @@ def batch_query_trackers(tracker_file, info_hash_hex, event, output_format, show
     sys.exit(0)
 
 # ────────────────────────────────────────────────
+# Retry/Redial Logic
+# ────────────────────────────────────────────────
+
+def test_tracker_with_retry(tracker_url, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want, scrape, lookup_dns, max_attempts):
+    """
+    Retry tracker connection until successful.
+
+    Args:
+        max_attempts: Maximum number of attempts. 0 means infinite retries.
+        All other args: passed to test_tracker()
+
+    Returns:
+        (success, response_time) tuple from successful attempt, or (False, None) if max attempts reached
+    """
+    # Color codes
+    YELLOW = '\033[1;33m'
+    GREEN = '\033[0;32m'
+    RED = '\033[0;31m'
+    BLUE = '\033[0;34m'
+    NC = '\033[0m'
+
+    if NOCOLOR:
+        YELLOW = GREEN = RED = BLUE = NC = ''
+
+    attempt = 0
+    retry_delay = 2  # seconds between retries
+
+    while True:
+        attempt += 1
+
+        # Show attempt number
+        if max_attempts > 0:
+            print(f"\n{BLUE}[Attempt {attempt}/{max_attempts}]{NC}")
+        else:
+            print(f"\n{BLUE}[Attempt {attempt}]{NC}")
+
+        # Try to connect
+        success, response_time = test_tracker(tracker_url, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want, scrape, lookup_dns)
+
+        if success:
+            print(f"\n{GREEN}✓ Connection successful after {attempt} attempt(s)!{NC}")
+            return True, response_time
+
+        # Check if we've reached max attempts
+        if max_attempts > 0 and attempt >= max_attempts:
+            print(f"\n{RED}✗ Failed after {max_attempts} attempt(s){NC}")
+            return False, None
+
+        # Wait before retry
+        print(f"{YELLOW}Connection failed. Retrying in {retry_delay} seconds...{NC}")
+        time.sleep(retry_delay)
+
+# ────────────────────────────────────────────────
 # Argument parsing
 # ────────────────────────────────────────────────
 
@@ -1383,11 +1438,25 @@ def main():
         help="Use scrape endpoint instead of announce. Only works with HTTP/HTTPS trackers."
     )
 
+    parser.add_argument(
+        '--redial',
+        metavar='COUNT',
+        nargs='?',
+        const=0,
+        type=int,
+        help="Retry connection until successful. Specify COUNT for max attempts (e.g., --redial 5), or omit for infinite retries (e.g., --redial). Only works in single-tracker mode."
+    )
+
     args = parser.parse_args()
 
     # Set global NOCOLOR flag
     global NOCOLOR
     NOCOLOR = args.nocolor
+
+    # Validate --redial only works in single-tracker mode
+    if args.redial is not None and args.batch:
+        print("Error: --redial only works in single-tracker mode, not in batch mode", file=sys.stderr)
+        sys.exit(2)
 
     # Validate --lookup requires --show-peers
     if args.lookup and not args.show_peers:
@@ -1420,7 +1489,13 @@ def main():
         batch_query_trackers(args.file, info_hash, args.event, args.format, args.show_peers, user_agent, peer_id, args.num_want, args.delay, args.random_qb, args.scrape, args.lookup)
     else:
         # Single tracker mode
-        success, response_time = test_tracker(args.tracker, info_hash, args.event, args.format, args.show_peers, user_agent, peer_id, args.num_want, args.scrape, args.lookup)
+        if args.redial is not None:
+            # Redial mode: retry until success or max attempts
+            max_attempts = args.redial if args.redial > 0 else 0  # 0 means infinite
+            success, response_time = test_tracker_with_retry(args.tracker, info_hash, args.event, args.format, args.show_peers, user_agent, peer_id, args.num_want, args.scrape, args.lookup, max_attempts)
+        else:
+            # Normal mode: single attempt
+            success, response_time = test_tracker(args.tracker, info_hash, args.event, args.format, args.show_peers, user_agent, peer_id, args.num_want, args.scrape, args.lookup)
         sys.exit(0 if success else 1)
 
 if __name__ == '__main__':
