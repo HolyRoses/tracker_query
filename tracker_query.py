@@ -13,6 +13,7 @@ Examples:
   ./tracker_test.py -t http://tracker.example.com/announce --event completed
   ./tracker_test.py --tracker udp://tracker2.com:6969 --hash deadbeef... --event started
   ./tracker_test.py -t http://tracker.example.com/announce --format json --show-peers
+  ./tracker_test.py -t http://tracker.example.com/announce --show-peers --lookup
   ./tracker_test.py -t http://tracker.example.com/announce --scrape
   ./tracker_test.py -t http://tracker.example.com/announce --scrape --hash deadbeef...
 """
@@ -244,10 +245,49 @@ def decode_dict_peers(peer_list):
     return peers
 
 # ────────────────────────────────────────────────
+# DNS Lookup Functions
+# ────────────────────────────────────────────────
+
+def extract_ipv4_from_mapped(ip):
+    """
+    Extract IPv4 address from IPv4-mapped IPv6 address (::ffff:x.x.x.x)
+    Returns the IPv4 address string if it's mapped, otherwise returns None
+    """
+    if ip.startswith('::ffff:'):
+        return ip[7:]  # Remove '::ffff:' prefix
+    return None
+
+def reverse_dns_lookup(ip):
+    """
+    Perform reverse DNS lookup on an IP address.
+    For IPv4-mapped IPv6 addresses (::ffff:x.x.x.x), extracts and looks up the IPv4 address.
+    Returns the DNS name if found, otherwise returns the original IP.
+    """
+    # Check if this is an IPv4-mapped IPv6 address
+    ipv4_addr = extract_ipv4_from_mapped(ip)
+    lookup_ip = ipv4_addr if ipv4_addr else ip
+
+    try:
+        # Perform reverse DNS lookup
+        hostname = socket.gethostbyaddr(lookup_ip)[0]
+        return hostname
+    except (socket.herror, socket.gaierror, OSError):
+        # Lookup failed, return original IP
+        return ip
+
+def apply_dns_lookup_to_peers(peer_list):
+    """
+    Apply DNS lookup to all peers in the list.
+    Modifies the peer dictionaries in-place, adding a 'hostname' field.
+    """
+    for peer in peer_list:
+        peer['hostname'] = reverse_dns_lookup(peer['ip'])
+
+# ────────────────────────────────────────────────
 # Output formatting (shared by HTTP and UDP)
 # ────────────────────────────────────────────────
 
-def format_table_output(data, show_peers=False):
+def format_table_output(data, show_peers=False, lookup_dns=False):
     """Format data as a clean aligned table"""
     # Color codes for batch mode
     BRIGHT_GREEN = '\033[1;32m'
@@ -327,17 +367,23 @@ def format_table_output(data, show_peers=False):
         print("─" * 50)
         for i, peer in enumerate(data['peer_list'], 1):
             peer_id_info = f" | ID: {peer['peer_id'][:16]}..." if 'peer_id' in peer else ""
-            print(f"{i:3d}. {peer['ip']:39s}:{peer['port']:<5d} [{peer['type']}]{peer_id_info}")
+            # Use hostname if lookup was performed, otherwise use IP
+            display_addr = peer.get('hostname', peer['ip']) if lookup_dns else peer['ip']
+            print(f"{i:3d}. {display_addr:39s}:{peer['port']:<5d} [{peer['type']}]{peer_id_info}")
         print("─" * 50)
 
-def format_json_output(data, show_peers=False):
+def format_json_output(data, show_peers=False, lookup_dns=False):
     """Format data as JSON"""
     if not show_peers:
         # Remove peer_list from output if not requested
         data = {k: v for k, v in data.items() if k != 'peer_list'}
+    elif lookup_dns and 'peer_list' in data:
+        # If lookup is enabled, include hostname in output but keep IP for reference
+        # JSON output will have both fields
+        pass
     print(json.dumps(data, indent=2))
 
-def format_csv_output(data, show_peers=False):
+def format_csv_output(data, show_peers=False, lookup_dns=False):
     """Format data as CSV"""
     keys = ['tracker', 'response_time_ms', 'interval', 'min_interval', 'seeds', 'leechers', 'downloaded',
             'ipv4_peers', 'ipv6_peers', 'warning_message', 'failure_reason', 'external_ip', 'tracker_id']
@@ -345,10 +391,17 @@ def format_csv_output(data, show_peers=False):
     print(",".join(str(data.get(k, '?')) for k in keys))
     
     if show_peers and data.get('peer_list'):
-        print("\nip,port,type,peer_id")
-        for peer in data['peer_list']:
-            peer_id = peer.get('peer_id', '')
-            print(f"{peer['ip']},{peer['port']},{peer['type']},{peer_id}")
+        if lookup_dns:
+            print("\nhostname,ip,port,type,peer_id")
+            for peer in data['peer_list']:
+                peer_id = peer.get('peer_id', '')
+                hostname = peer.get('hostname', peer['ip'])
+                print(f"{hostname},{peer['ip']},{peer['port']},{peer['type']},{peer_id}")
+        else:
+            print("\nip,port,type,peer_id")
+            for peer in data['peer_list']:
+                peer_id = peer.get('peer_id', '')
+                print(f"{peer['ip']},{peer['port']},{peer['type']},{peer_id}")
 
 def format_scrape_table_output(data):
     """Format scrape data as a clean aligned table"""
@@ -436,7 +489,7 @@ def build_announce_url(tracker_url, info_hash_bytes, event, peer_id, num_want):
     query = urllib.parse.urlencode(params, doseq=False, safe='~')
     return f"{tracker_url}?{query}"
 
-def test_http_tracker(tracker_url, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want):
+def test_http_tracker(tracker_url, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want, lookup_dns=False):
     """Test HTTP/HTTPS tracker and return response time in milliseconds"""
     start_time = time.time()
 
@@ -546,6 +599,10 @@ def test_http_tracker(tracker_url, info_hash_hex, event, output_format, show_pee
                 ipv6_count = len(peers_ipv6) // 18 if isinstance(peers_ipv6, bytes) else len(peers_ipv6) if isinstance(peers_ipv6, list) else 0
                 total_peers_returned = len(peer_list)
 
+                # Perform DNS lookup if requested
+                if lookup_dns and show_peers and peer_list:
+                    apply_dns_lookup_to_peers(peer_list)
+
                 data = {
                     'tracker': tracker_url,
                     'interval': interval,
@@ -568,11 +625,11 @@ def test_http_tracker(tracker_url, info_hash_hex, event, output_format, show_pee
                 }
 
                 if output_format == 'json':
-                    format_json_output(data, show_peers)
+                    format_json_output(data, show_peers, lookup_dns)
                 elif output_format == 'csv':
-                    format_csv_output(data, show_peers)
+                    format_csv_output(data, show_peers, lookup_dns)
                 else:  # table
-                    format_table_output(data, show_peers)
+                    format_table_output(data, show_peers, lookup_dns)
 
                 # Exit with error if there was a failure reason
                 if failure_reason:
@@ -874,7 +931,7 @@ def udp_announce(sock, addr, connection_id, transaction_id, info_hash_bytes, eve
         'peers_data': peers_data
     }
 
-def test_udp_tracker(tracker_url, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want):
+def test_udp_tracker(tracker_url, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want, lookup_dns=False):
     """Test UDP tracker and return response time in milliseconds"""
     start_time = time.time()
 
@@ -1009,6 +1066,10 @@ def test_udp_tracker(tracker_url, info_hash_hex, event, output_format, show_peer
 
         total_peers_returned = len(peer_list)
 
+        # Perform DNS lookup if requested
+        if lookup_dns and show_peers and peer_list:
+            apply_dns_lookup_to_peers(peer_list)
+
         data = {
             'tracker': tracker_url,
             'interval': announce_response['interval'],
@@ -1031,11 +1092,11 @@ def test_udp_tracker(tracker_url, info_hash_hex, event, output_format, show_peer
         }
 
         if output_format == 'json':
-            format_json_output(data, show_peers)
+            format_json_output(data, show_peers, lookup_dns)
         elif output_format == 'csv':
-            format_csv_output(data, show_peers)
+            format_csv_output(data, show_peers, lookup_dns)
         else:  # table
-            format_table_output(data, show_peers)
+            format_table_output(data, show_peers, lookup_dns)
         
     finally:
         sock.close()
@@ -1047,10 +1108,10 @@ def test_udp_tracker(tracker_url, info_hash_hex, event, output_format, show_peer
 # Main dispatcher
 # ────────────────────────────────────────────────
 
-def test_tracker(tracker_url, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want, scrape=False):
+def test_tracker(tracker_url, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want, scrape=False, lookup_dns=False):
     """Route to HTTP or UDP tracker based on URL scheme (returns (success, response_time) for batch mode)"""
     try:
-        response_time = _test_tracker_impl(tracker_url, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want, scrape)
+        response_time = _test_tracker_impl(tracker_url, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want, scrape, lookup_dns)
         return True, response_time
     except SystemExit as e:
         # Catch sys.exit() calls and convert to return value
@@ -1059,7 +1120,7 @@ def test_tracker(tracker_url, info_hash_hex, event, output_format, show_peers, u
         print(f"Error: {e}", file=sys.stderr)
         return False, None
 
-def _test_tracker_impl(tracker_url, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want, scrape=False):
+def _test_tracker_impl(tracker_url, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want, scrape=False, lookup_dns=False):
     """Internal implementation - routes to HTTP or UDP tracker based on URL scheme, returns response_time"""
     parsed = urllib.parse.urlparse(tracker_url)
     scheme = parsed.scheme.lower()
@@ -1068,12 +1129,12 @@ def _test_tracker_impl(tracker_url, info_hash_hex, event, output_format, show_pe
         if scrape:
             return test_http_scrape(tracker_url, info_hash_hex, output_format, show_peers, user_agent)
         else:
-            return test_http_tracker(tracker_url, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want)
+            return test_http_tracker(tracker_url, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want, lookup_dns)
     elif scheme == 'udp':
         if scrape:
             print("Error: Scrape is only supported for HTTP/HTTPS trackers, not UDP.", file=sys.stderr)
             sys.exit(2)
-        return test_udp_tracker(tracker_url, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want)
+        return test_udp_tracker(tracker_url, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want, lookup_dns)
     else:
         print(f"Error: Unsupported tracker scheme '{scheme}'. Only http, https, and udp are supported.", file=sys.stderr)
         sys.exit(2)
@@ -1082,7 +1143,7 @@ def _test_tracker_impl(tracker_url, info_hash_hex, event, output_format, show_pe
 # Batch mode functionality
 # ────────────────────────────────────────────────
 
-def batch_query_trackers(tracker_file, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want, delay, random_qb, scrape=False):
+def batch_query_trackers(tracker_file, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want, delay, random_qb, scrape=False, lookup_dns=False):
     """Query multiple trackers from a file"""
     # Color codes
     RED = '\033[0;31m'
@@ -1151,7 +1212,7 @@ def batch_query_trackers(tracker_file, info_hash_hex, event, output_format, show
             user_agent, peer_id = get_random_qb_client()
 
         # Query the tracker - use table format always in batch mode
-        success, response_time = test_tracker(tracker, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want, scrape)
+        success, response_time = test_tracker(tracker, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want, scrape, lookup_dns)
 
         if success:
             success_count += 1
@@ -1283,6 +1344,12 @@ def main():
     )
 
     parser.add_argument(
+        '-l', '--lookup',
+        action='store_true',
+        help="Perform reverse DNS lookup on peer IP addresses. Requires --show-peers. IPv4-mapped IPv6 addresses (::ffff:x.x.x.x) are handled automatically."
+    )
+
+    parser.add_argument(
         '-r', '--random-qb',
         action='store_true',
         help="Use a random qBittorrent client version for the announce (spoofs User-Agent and peer_id)"
@@ -1322,6 +1389,11 @@ def main():
     global NOCOLOR
     NOCOLOR = args.nocolor
 
+    # Validate --lookup requires --show-peers
+    if args.lookup and not args.show_peers:
+        print("Error: --lookup requires --show-peers to be specified", file=sys.stderr)
+        sys.exit(2)
+
     # Handle hash argument - can be list (from append) or None
     if args.hash is None or len(args.hash) == 0:
         # No hash provided - use default
@@ -1345,10 +1417,10 @@ def main():
 
     # Run batch or single mode
     if args.batch:
-        batch_query_trackers(args.file, info_hash, args.event, args.format, args.show_peers, user_agent, peer_id, args.num_want, args.delay, args.random_qb, args.scrape)
+        batch_query_trackers(args.file, info_hash, args.event, args.format, args.show_peers, user_agent, peer_id, args.num_want, args.delay, args.random_qb, args.scrape, args.lookup)
     else:
         # Single tracker mode
-        success, response_time = test_tracker(args.tracker, info_hash, args.event, args.format, args.show_peers, user_agent, peer_id, args.num_want, args.scrape)
+        success, response_time = test_tracker(args.tracker, info_hash, args.event, args.format, args.show_peers, user_agent, peer_id, args.num_want, args.scrape, args.lookup)
         sys.exit(0 if success else 1)
 
 if __name__ == '__main__':

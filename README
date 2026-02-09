@@ -1,4 +1,4 @@
-usage: tracker_query.py [-h] [-b] [-t URL] [-H HEX] [-e EVENT] [-o FORMAT] [-f FILE] [-p] [-r] [-n NUM] [-d SECONDS] [--nocolor] [-s]
+usage: tracker_query.py [-h] [-b] [-t URL] [-H HEX] [-e EVENT] [-o FORMAT] [-f FILE] [-p] [-l] [-r] [-n NUM] [-d SECONDS] [--nocolor] [-s]
 
 Query a BitTorrent tracker announce endpoint and display swarm info (seeds, leechers, peers). Supports HTTP/HTTPS and UDP trackers, as well as HTTP/HTTPS scrape requests.
 
@@ -11,6 +11,7 @@ optional arguments:
   -o FORMAT, --format FORMAT   Output format: table, json, or csv. (default: table)
   -f FILE, --file FILE         Tracker list file for batch mode (one tracker URL per line, # for comments) (default: trackers_to_query.txt)
   -p, --show-peers             Display the full list of peers (IP:port). Only applies to announce mode. (default: False)
+  -l, --lookup                 Perform reverse DNS lookup on peer IP addresses. Requires --show-peers. IPv4-mapped IPv6 addresses (::ffff:x.x.x.x) are handled automatically. (default: False)
   -r, --random-qb              Use a random qBittorrent client version for the announce (spoofs User-Agent and peer_id) (default: False)
   -n NUM, --num-want NUM       Number of peers to request from tracker. Ignored in scrape mode. (default: 50)
   -d SECONDS, --delay SECONDS  Delay between queries in batch mode (in seconds). Ignored in single-tracker mode. (default: 1.0)
