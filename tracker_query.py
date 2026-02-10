@@ -16,8 +16,8 @@ Examples:
   ./tracker_test.py -t http://tracker.example.com/announce --show-peers --lookup
   ./tracker_test.py -t http://tracker.example.com/announce --scrape
   ./tracker_test.py -t http://tracker.example.com/announce --scrape --hash deadbeef...
-  ./tracker_test.py -t udp://flaky.tracker.com:1337/announce --redial
-  ./tracker_test.py -t http://tracker.example.com/announce --redial 5
+  ./tracker_test.py -t udp://flaky.tracker.com:1337/announce --retry
+  ./tracker_test.py -t http://tracker.example.com/announce -R 5
 """
 
 import sys
@@ -1286,7 +1286,7 @@ def batch_query_trackers(tracker_file, info_hash_hex, event, output_format, show
     sys.exit(0)
 
 # ────────────────────────────────────────────────
-# Retry/Redial Logic
+# Retry Logic
 # ────────────────────────────────────────────────
 
 def test_tracker_with_retry(tracker_url, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want, scrape, lookup_dns, max_attempts):
@@ -1439,12 +1439,12 @@ def main():
     )
 
     parser.add_argument(
-        '--redial',
+        '-R', '--retry',
         metavar='COUNT',
         nargs='?',
         const=0,
         type=int,
-        help="Retry connection until successful. Specify COUNT for max attempts (e.g., --redial 5), or omit for infinite retries (e.g., --redial). Only works in single-tracker mode."
+        help="Retry connection until successful. Specify COUNT for max attempts (e.g., --retry 5 or -R 5), or omit for infinite retries (e.g., --retry or -R). Only works in single-tracker mode."
     )
 
     args = parser.parse_args()
@@ -1453,9 +1453,9 @@ def main():
     global NOCOLOR
     NOCOLOR = args.nocolor
 
-    # Validate --redial only works in single-tracker mode
-    if args.redial is not None and args.batch:
-        print("Error: --redial only works in single-tracker mode, not in batch mode", file=sys.stderr)
+    # Validate --retry only works in single-tracker mode
+    if args.retry is not None and args.batch:
+        print("Error: --retry only works in single-tracker mode, not in batch mode", file=sys.stderr)
         sys.exit(2)
 
     # Validate --lookup requires --show-peers
@@ -1489,9 +1489,9 @@ def main():
         batch_query_trackers(args.file, info_hash, args.event, args.format, args.show_peers, user_agent, peer_id, args.num_want, args.delay, args.random_qb, args.scrape, args.lookup)
     else:
         # Single tracker mode
-        if args.redial is not None:
-            # Redial mode: retry until success or max attempts
-            max_attempts = args.redial if args.redial > 0 else 0  # 0 means infinite
+        if args.retry is not None:
+            # Retry mode: retry until success or max attempts
+            max_attempts = args.retry if args.retry > 0 else 0  # 0 means infinite
             success, response_time = test_tracker_with_retry(args.tracker, info_hash, args.event, args.format, args.show_peers, user_agent, peer_id, args.num_want, args.scrape, args.lookup, max_attempts)
         else:
             # Normal mode: single attempt
