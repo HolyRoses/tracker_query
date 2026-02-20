@@ -22,6 +22,7 @@ Examples:
 
 import sys
 import argparse
+import gzip
 import urllib.parse
 import urllib.request
 import json
@@ -513,13 +514,18 @@ def test_http_tracker(tracker_url, info_hash_hex, event, output_format, show_pee
         print(f"Client: {user_agent}")
         print(f"URL: {url[:140]}{'...' if len(url) > 140 else ''}")
 
-    req = urllib.request.Request(url, headers={'User-Agent': user_agent}, method='GET')
+    req = urllib.request.Request(url, headers={'User-Agent': user_agent, 'Accept-Encoding': 'gzip'}, method='GET')
 
     try:
         with urllib.request.urlopen(req, timeout=DEFAULT_TIMEOUT) as resp:
             response_time_ms = (time.time() - start_time) * 1000
             status = resp.getcode()
             body = resp.read()
+
+            # Decompress if tracker honoured our Accept-Encoding: gzip
+            content_encoding = resp.getheader('Content-Encoding', '')
+            if 'gzip' in content_encoding.lower():
+                body = gzip.decompress(body)
 
             # Only print status for table format
             if output_format == 'table':
@@ -738,7 +744,7 @@ def test_http_scrape(tracker_url, info_hash_hex, output_format, show_peers, user
         print(f"Scraping {hash_count} torrent{'s' if hash_count > 1 else ''}")
         print(f"Scrape URL: {full_url[:120]}{'...' if len(full_url) > 120 else ''}")
 
-    req = urllib.request.Request(full_url, headers={'User-Agent': user_agent}, method='GET')
+    req = urllib.request.Request(full_url, headers={'User-Agent': user_agent, 'Accept-Encoding': 'gzip'}, method='GET')
 
     try:
         with urllib.request.urlopen(req, timeout=DEFAULT_TIMEOUT) as resp:
@@ -746,10 +752,9 @@ def test_http_scrape(tracker_url, info_hash_hex, output_format, show_peers, user
             status = resp.getcode()
             body = resp.read()
 
-            # Check for gzip compression
+            # Decompress if tracker honoured our Accept-Encoding: gzip
             content_encoding = resp.getheader('Content-Encoding', '')
             if 'gzip' in content_encoding.lower():
-                import gzip
                 body = gzip.decompress(body)
 
             # Only print status for table format
