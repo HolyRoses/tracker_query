@@ -1,4 +1,4 @@
-usage: tracker_query.py [-h] [-b] [-t URL] [-H HEX] [-e EVENT] [-o FORMAT] [-f FILE] [-p] [-l] [-r] [-n NUM] [-d SECONDS] [--nocolor] [-s] [-R [COUNT]]
+usage: tracker_query.py [-h] [-b] [-t URL] [-H HEX] [-e EVENT] [-o FORMAT] [-f FILE] [-p] [-l] [-r] [-n NUM] [-L BYTES] [-d SECONDS] [--nocolor] [-s] [-R [COUNT]]
 
 Query a BitTorrent tracker announce endpoint and display swarm info (seeds, leechers, peers). Supports HTTP/HTTPS and UDP trackers, as well as HTTP/HTTPS scrape requests.
 
@@ -14,6 +14,7 @@ optional arguments:
   -l, --lookup                 Perform reverse DNS lookup on peer IP addresses. Requires --show-peers. IPv4-mapped IPv6 addresses (::ffff:x.x.x.x) are handled automatically. (default: False)
   -r, --random-qb              Use a random qBittorrent client version for the announce (spoofs User-Agent and peer_id) (default: False)
   -n NUM, --num-want NUM       Number of peers to request from tracker. Ignored in scrape mode. (default: 50)
+  -L BYTES, --left BYTES       Bytes remaining to download. Defaults to 0 for --event completed, 1000000000 otherwise. Use 0 to announce as a seeder. (default: None)
   -d SECONDS, --delay SECONDS  Delay between queries in batch mode (in seconds). Ignored in single-tracker mode. (default: 1.0)
   --nocolor                    Disable colored output (useful for redirecting to files) (default: False)
   -s, --scrape                 Use scrape endpoint instead of announce. Only works with HTTP/HTTPS trackers. (default: False)
