@@ -470,14 +470,14 @@ def format_scrape_table_output(data):
 # HTTP Tracker Functions
 # ────────────────────────────────────────────────
 
-def build_announce_url(tracker_url, info_hash_bytes, event, peer_id, num_want):
+def build_announce_url(tracker_url, info_hash_bytes, event, peer_id, num_want, left=1000000000):
     params = {
         'info_hash':   info_hash_bytes,
         'peer_id':     peer_id,
         'port':        '6881',
         'uploaded':    '0',
         'downloaded':  '0',
-        'left':        '1000000000',
+        'left':        str(left),
         'compact':     '1',
         'no_peer_id':  '1',
         'numwant':     str(num_want),
@@ -491,7 +491,7 @@ def build_announce_url(tracker_url, info_hash_bytes, event, peer_id, num_want):
     query = urllib.parse.urlencode(params, doseq=False, safe='~')
     return f"{tracker_url}?{query}"
 
-def test_http_tracker(tracker_url, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want, lookup_dns=False):
+def test_http_tracker(tracker_url, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want, lookup_dns=False, left=1000000000):
     """Test HTTP/HTTPS tracker and return response time in milliseconds"""
     start_time = time.time()
 
@@ -503,7 +503,7 @@ def test_http_tracker(tracker_url, info_hash_hex, event, output_format, show_pee
         print(f"Error: Invalid info hash — {e}", file=sys.stderr)
         sys.exit(2)
 
-    url = build_announce_url(tracker_url, info_hash_bytes, event, peer_id, num_want)
+    url = build_announce_url(tracker_url, info_hash_bytes, event, peer_id, num_want, left)
 
     # Only print headers for table format (not for json/csv)
     if output_format == 'table':
@@ -580,16 +580,35 @@ def test_http_tracker(tracker_url, info_hash_hex, event, output_format, show_pee
                 peers_ipv4 = decoded.get(b'peers', b'')
                 peers_ipv6 = decoded.get(b'peers6', b'')
 
+                # Detect if we connected via IPv6 — same approach as UDP:
+                # resolve the hostname and check the address family.
+                # Literal IPv6 brackets e.g. http://[2601:...] are handled
+                # automatically since getaddrinfo resolves them correctly too.
+                try:
+                    _parsed = urllib.parse.urlparse(tracker_url)
+                    _ai = socket.getaddrinfo(_parsed.hostname, None, socket.AF_UNSPEC)
+                    tracker_is_ipv6 = bool(_ai) and _ai[0][0] == socket.AF_INET6
+                except (socket.gaierror, OSError):
+                    tracker_is_ipv6 = False  # can't resolve — assume IPv4
+
+                # Warn if IPv6 client received IPv4 peers with no peers6 —
+                # same validation the UDP path performs via is_ipv6
+                if tracker_is_ipv6 and output_format == 'table':
+                    has_ipv4 = isinstance(peers_ipv4, bytes) and len(peers_ipv4) > 0 or isinstance(peers_ipv4, list) and len(peers_ipv4) > 0
+                    has_ipv6 = isinstance(peers_ipv6, bytes) and len(peers_ipv6) > 0 or isinstance(peers_ipv6, list) and len(peers_ipv6) > 0
+                    if has_ipv4 and not has_ipv6:
+                        print('Warning: Connected via IPv6 but received IPv4 peers response (no peers6 field)')
+
                 # Decode peers
                 peer_list = []
-                
+
                 # Handle compact IPv4 peers (binary format)
                 if isinstance(peers_ipv4, bytes) and len(peers_ipv4) > 0:
                     peer_list.extend(decode_compact_peers_ipv4(peers_ipv4))
                 # Handle dictionary format peers
                 elif isinstance(peers_ipv4, list):
                     peer_list.extend(decode_dict_peers(peers_ipv4))
-                
+
                 # Handle compact IPv6 peers (binary format)
                 if isinstance(peers_ipv6, bytes) and len(peers_ipv6) > 0:
                     peer_list.extend(decode_compact_peers_ipv6(peers_ipv6))
@@ -872,7 +891,7 @@ def udp_connect(sock, addr, transaction_id):
 
     return connection_id
 
-def udp_announce(sock, addr, connection_id, transaction_id, info_hash_bytes, event, peer_id, num_want):
+def udp_announce(sock, addr, connection_id, transaction_id, info_hash_bytes, event, peer_id, num_want, left=1000000000):
     """Send UDP announce request and return parsed response"""
     # Map event string to UDP event codes
     event_map = {'started': 2, 'completed': 1, 'stopped': 3, 'none': 0}
@@ -891,7 +910,7 @@ def udp_announce(sock, addr, connection_id, transaction_id, info_hash_bytes, eve
         info_hash_bytes,         # info_hash
         peer_id,                 # peer_id
         0,                       # downloaded
-        1000000000,              # left
+        left,                    # left
         0,                       # uploaded
         event_code,              # event
         0,                       # ip (0 = default)
@@ -933,7 +952,7 @@ def udp_announce(sock, addr, connection_id, transaction_id, info_hash_bytes, eve
         'peers_data': peers_data
     }
 
-def test_udp_tracker(tracker_url, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want, lookup_dns=False):
+def test_udp_tracker(tracker_url, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want, lookup_dns=False, left=1000000000):
     """Test UDP tracker and return response time in milliseconds"""
     start_time = time.time()
 
@@ -1006,7 +1025,7 @@ def test_udp_tracker(tracker_url, info_hash_hex, event, output_format, show_peer
         if output_format == 'table':
             print(f"Sending announce request (transaction_id: {transaction_id})...")
         try:
-            announce_response = udp_announce(sock, addr, connection_id, transaction_id, info_hash_bytes, event, peer_id, num_want)
+            announce_response = udp_announce(sock, addr, connection_id, transaction_id, info_hash_bytes, event, peer_id, num_want, left)
             response_time_ms = (time.time() - start_time) * 1000
         except (TimeoutError, ValueError) as e:
             if output_format == 'table':
@@ -1110,10 +1129,10 @@ def test_udp_tracker(tracker_url, info_hash_hex, event, output_format, show_peer
 # Main dispatcher
 # ────────────────────────────────────────────────
 
-def test_tracker(tracker_url, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want, scrape=False, lookup_dns=False):
+def test_tracker(tracker_url, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want, scrape=False, lookup_dns=False, left=1000000000):
     """Route to HTTP or UDP tracker based on URL scheme (returns (success, response_time) for batch mode)"""
     try:
-        response_time = _test_tracker_impl(tracker_url, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want, scrape, lookup_dns)
+        response_time = _test_tracker_impl(tracker_url, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want, scrape, lookup_dns, left)
         return True, response_time
     except SystemExit as e:
         # Catch sys.exit() calls and convert to return value
@@ -1122,7 +1141,7 @@ def test_tracker(tracker_url, info_hash_hex, event, output_format, show_peers, u
         print(f"Error: {e}", file=sys.stderr)
         return False, None
 
-def _test_tracker_impl(tracker_url, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want, scrape=False, lookup_dns=False):
+def _test_tracker_impl(tracker_url, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want, scrape=False, lookup_dns=False, left=1000000000):
     """Internal implementation - routes to HTTP or UDP tracker based on URL scheme, returns response_time"""
     parsed = urllib.parse.urlparse(tracker_url)
     scheme = parsed.scheme.lower()
@@ -1131,12 +1150,12 @@ def _test_tracker_impl(tracker_url, info_hash_hex, event, output_format, show_pe
         if scrape:
             return test_http_scrape(tracker_url, info_hash_hex, output_format, show_peers, user_agent)
         else:
-            return test_http_tracker(tracker_url, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want, lookup_dns)
+            return test_http_tracker(tracker_url, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want, lookup_dns, left)
     elif scheme == 'udp':
         if scrape:
             print("Error: Scrape is only supported for HTTP/HTTPS trackers, not UDP.", file=sys.stderr)
             sys.exit(2)
-        return test_udp_tracker(tracker_url, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want, lookup_dns)
+        return test_udp_tracker(tracker_url, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want, lookup_dns, left)
     else:
         print(f"Error: Unsupported tracker scheme '{scheme}'. Only http, https, and udp are supported.", file=sys.stderr)
         sys.exit(2)
@@ -1145,7 +1164,7 @@ def _test_tracker_impl(tracker_url, info_hash_hex, event, output_format, show_pe
 # Batch mode functionality
 # ────────────────────────────────────────────────
 
-def batch_query_trackers(tracker_file, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want, delay, random_qb, scrape=False, lookup_dns=False):
+def batch_query_trackers(tracker_file, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want, delay, random_qb, scrape=False, lookup_dns=False, left=1000000000):
     """Query multiple trackers from a file"""
     # Color codes
     RED = '\033[0;31m'
@@ -1289,7 +1308,7 @@ def batch_query_trackers(tracker_file, info_hash_hex, event, output_format, show
 # Retry Logic
 # ────────────────────────────────────────────────
 
-def test_tracker_with_retry(tracker_url, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want, scrape, lookup_dns, max_attempts):
+def test_tracker_with_retry(tracker_url, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want, scrape, lookup_dns, max_attempts, left=1000000000):
     """
     Retry tracker connection until successful.
 
@@ -1323,7 +1342,7 @@ def test_tracker_with_retry(tracker_url, info_hash_hex, event, output_format, sh
             print(f"\n{BLUE}[Attempt {attempt}]{NC}")
 
         # Try to connect
-        success, response_time = test_tracker(tracker_url, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want, scrape, lookup_dns)
+        success, response_time = test_tracker(tracker_url, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want, scrape, lookup_dns, left)
 
         if success:
             print(f"\n{GREEN}✓ Connection successful after {attempt} attempt(s)!{NC}")
@@ -1419,6 +1438,14 @@ def main():
     )
 
     parser.add_argument(
+        '-L', '--left',
+        metavar='BYTES',
+        type=int,
+        default=None,
+        help="Bytes remaining to download. Defaults to 0 for --event completed, 1000000000 otherwise. Use 0 to announce as a seeder."
+    )
+
+    parser.add_argument(
         '-d', '--delay',
         metavar='SECONDS',
         type=float,
@@ -1477,6 +1504,14 @@ def main():
             sys.exit(2)
         info_hash = args.hash  # Keep as list for scrape
 
+    # Resolve left value: explicit flag wins; otherwise smart default by event
+    if args.left is not None:
+        left = args.left
+    elif args.event == 'completed':
+        left = 0
+    else:
+        left = 1000000000
+
     # Determine client info
     if args.random_qb:
         user_agent, peer_id = get_random_qb_client()
@@ -1486,16 +1521,16 @@ def main():
 
     # Run batch or single mode
     if args.batch:
-        batch_query_trackers(args.file, info_hash, args.event, args.format, args.show_peers, user_agent, peer_id, args.num_want, args.delay, args.random_qb, args.scrape, args.lookup)
+        batch_query_trackers(args.file, info_hash, args.event, args.format, args.show_peers, user_agent, peer_id, args.num_want, args.delay, args.random_qb, args.scrape, args.lookup, left)
     else:
         # Single tracker mode
         if args.retry is not None:
             # Retry mode: retry until success or max attempts
             max_attempts = args.retry if args.retry > 0 else 0  # 0 means infinite
-            success, response_time = test_tracker_with_retry(args.tracker, info_hash, args.event, args.format, args.show_peers, user_agent, peer_id, args.num_want, args.scrape, args.lookup, max_attempts)
+            success, response_time = test_tracker_with_retry(args.tracker, info_hash, args.event, args.format, args.show_peers, user_agent, peer_id, args.num_want, args.scrape, args.lookup, max_attempts, left)
         else:
             # Normal mode: single attempt
-            success, response_time = test_tracker(args.tracker, info_hash, args.event, args.format, args.show_peers, user_agent, peer_id, args.num_want, args.scrape, args.lookup)
+            success, response_time = test_tracker(args.tracker, info_hash, args.event, args.format, args.show_peers, user_agent, peer_id, args.num_want, args.scrape, args.lookup, left)
         sys.exit(0 if success else 1)
 
 if __name__ == '__main__':
