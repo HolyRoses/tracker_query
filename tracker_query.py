@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Tracker announce tester – Synology DSM compatible (no external modules)
+Tracker announce tester
 
 Queries a BitTorrent tracker announce endpoint and shows
 seeds / leechers / peer counts from the bencoded response.
