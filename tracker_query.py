@@ -696,8 +696,12 @@ def test_http_scrape(tracker_url, info_hash_hex, output_format, show_peers, user
         print(f"Error: {error}", file=sys.stderr)
         sys.exit(2)
 
-    # Handle single hash or multiple hashes
-    if isinstance(info_hash_hex, list):
+    # Handle full scrape (no hash), single hash, or multiple hashes
+    if info_hash_hex is None:
+        # Full scrape — no info_hash parameter sent
+        full_url = scrape_url
+        info_hash_list = []
+    elif isinstance(info_hash_hex, list):
         # Multiple hashes
         info_hash_list = []
         for hash_hex in info_hash_hex:
@@ -709,6 +713,13 @@ def test_http_scrape(tracker_url, info_hash_hex, output_format, show_peers, user
             except ValueError as e:
                 print(f"Error: Invalid info hash — {e}", file=sys.stderr)
                 sys.exit(2)
+        params_list = []
+        for hash_bytes in info_hash_list:
+            params = {'info_hash': hash_bytes}
+            params_list.append(urllib.parse.urlencode(params, doseq=False, safe='~'))
+        query_string = '&'.join(params_list)
+        separator = '&' if '?' in scrape_url else '?'
+        full_url = f"{scrape_url}{separator}{query_string}"
     else:
         # Single hash
         try:
@@ -719,20 +730,10 @@ def test_http_scrape(tracker_url, info_hash_hex, output_format, show_peers, user
         except ValueError as e:
             print(f"Error: Invalid info hash — {e}", file=sys.stderr)
             sys.exit(2)
-
-    # Build scrape URL with info_hash parameter(s)
-    # Build query string with multiple info_hash params if needed
-    params_list = []
-    for hash_bytes in info_hash_list:
-        params = {'info_hash': hash_bytes}
-        params_list.append(urllib.parse.urlencode(params, doseq=False, safe='~'))
-
-    # Join with & for multiple hashes
-    query_string = '&'.join(params_list)
-
-    # Check if scrape_url already has query params
-    separator = '&' if '?' in scrape_url else '?'
-    full_url = f"{scrape_url}{separator}{query_string}"
+        params = {'info_hash': info_hash_list[0]}
+        query_string = urllib.parse.urlencode(params, doseq=False, safe='~')
+        separator = '&' if '?' in scrape_url else '?'
+        full_url = f"{scrape_url}{separator}{query_string}"
 
     # Only print headers for table format (not for json/csv)
     if output_format == 'table':
@@ -741,7 +742,10 @@ def test_http_scrape(tracker_url, info_hash_hex, output_format, show_peers, user
         print(f"{'─' * 50}")
         print(f"Client: {user_agent}")
         hash_count = len(info_hash_list)
-        print(f"Scraping {hash_count} torrent{'s' if hash_count > 1 else ''}")
+        if hash_count == 0:
+            print("Full scrape (no hash)")
+        else:
+            print(f"Scraping {hash_count} torrent{'s' if hash_count > 1 else ''}")
         print(f"Scrape URL: {full_url[:120]}{'...' if len(full_url) > 120 else ''}")
 
     req = urllib.request.Request(full_url, headers={'User-Agent': user_agent, 'Accept-Encoding': 'gzip'}, method='GET')
@@ -1471,6 +1475,12 @@ def main():
     )
 
     parser.add_argument(
+        '--full-scrape',
+        action='store_true',
+        help="Scrape with no info_hash (implies --scrape). Tests if tracker allows full scrape."
+    )
+
+    parser.add_argument(
         '-R', '--retry',
         metavar='COUNT',
         nargs='?',
@@ -1495,8 +1505,12 @@ def main():
         print("Error: --lookup requires --show-peers to be specified", file=sys.stderr)
         sys.exit(2)
 
+    # --full-scrape implies --scrape with no hash
+    if args.full_scrape:
+        args.scrape = True
+        info_hash = None  # No hash = full scrape
     # Handle hash argument - can be list (from append) or None
-    if args.hash is None or len(args.hash) == 0:
+    elif args.hash is None or len(args.hash) == 0:
         # No hash provided - use default
         info_hash = DEFAULT_INFO_HASH_HEX
     elif len(args.hash) == 1:
