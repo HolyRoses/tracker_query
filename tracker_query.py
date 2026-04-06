@@ -23,6 +23,8 @@ Examples:
 import sys
 import argparse
 import gzip
+import zlib
+import io
 import urllib.parse
 import urllib.request
 import json
@@ -31,6 +33,16 @@ import struct
 import random
 import time
 import os
+
+try:
+    import brotli  # type: ignore
+except Exception:
+    brotli = None
+
+try:
+    import zstandard as zstd  # type: ignore
+except Exception:
+    zstd = None
 
 
 
@@ -48,6 +60,42 @@ DEFAULT_USER_AGENT    = "qBittorrent/5.1.4"
 DEFAULT_TIMEOUT       = 12
 DEFAULT_EVENT         = 'started'
 DEFAULT_NUM_WANT      = 50
+DEFAULT_LEFT          = 1_000_000_000
+DEFAULT_ACCEPT_ENCODING = 'all'
+
+
+def _nocolor_active(nocolor=None):
+    """Resolve effective nocolor setting (explicit arg overrides global)."""
+    if nocolor is None:
+        return NOCOLOR
+    return bool(nocolor)
+
+
+def _color_palette(nocolor=None):
+    """Return ANSI color palette with optional nocolor override."""
+    colors = {
+        'BRIGHT_GREEN': '\033[1;32m',
+        'GREEN': '\033[0;32m',
+        'YELLOW': '\033[1;33m',
+        'RED': '\033[0;31m',
+        'BLUE': '\033[0;34m',
+        'NC': '\033[0m',
+    }
+    if _nocolor_active(nocolor):
+        for k in colors:
+            colors[k] = ''
+    return colors
+
+
+def _response_time_color_and_label(response_time, colors):
+    """Map response time to (color, label)."""
+    if response_time < 150:
+        return colors['BRIGHT_GREEN'], "Excellent"
+    if response_time < 300:
+        return colors['GREEN'], "Good"
+    if response_time < 500:
+        return colors['YELLOW'], "OK"
+    return colors['RED'], "Slow"
 
 # qBittorrent version data for --random-qb
 QB_VERSIONS = [
@@ -134,12 +182,6 @@ def convert_announce_to_scrape(announce_url):
     if not after_slash.startswith('announce'):
         return None, f"Scrape not supported: path doesn't contain 'announce' after last '/' (found '{after_slash}')"
 
-    # Check for entity quoting issues that would prevent scrape support
-    # The path before the last slash should not contain encoded slashes or the word 'announce'
-    before_last_slash = path[:last_slash_idx]
-    if '%06' in before_last_slash and '4' in before_last_slash:  # checking for %064 pattern
-        return None, "Scrape not supported: encoded characters in path before 'announce'"
-
     # Replace 'announce' with 'scrape'
     scrape_component = 'scrape' + after_slash[len('announce'):]
     scrape_path = path[:last_slash_idx + 1] + scrape_component
@@ -181,12 +223,15 @@ def bdecode(data):
                 val, i = decode(i)
                 d[key] = val
             return d, i + 1
-        elif 48 <= b <= 57 or b == ord('-'):  # digit or negative for length
+        elif 48 <= b <= 57:  # byte-string length must start with a digit
             colon = data.index(b':', i)
             length_str = data[i:colon].decode('ascii')
             length = int(length_str)
             start = colon + 1
-            return data[start:start + length], start + length
+            end = start + length
+            if end > len(data):
+                raise ValueError(f"Invalid bencode: string length out of bounds at {i} (len={length})")
+            return data[start:end], end
         else:
             raise ValueError(f"Unexpected byte at {i}: {chr(b) if 32 <= b <= 126 else hex(b)}")
 
@@ -290,18 +335,14 @@ def apply_dns_lookup_to_peers(peer_list):
 # Output formatting (shared by HTTP and UDP)
 # ────────────────────────────────────────────────
 
-def format_table_output(data, show_peers=False, lookup_dns=False):
+def format_table_output(data, show_peers=False, lookup_dns=False, nocolor=None):
     """Format data as a clean aligned table"""
-    # Color codes for batch mode
-    BRIGHT_GREEN = '\033[1;32m'
-    GREEN = '\033[0;32m'
-    YELLOW = '\033[1;33m'
-    RED = '\033[0;31m'
-    NC = '\033[0m'  # No Color
-
-    # Skip colors if not in batch mode or if nocolor flag is set
-    if not data.get('batch_mode') or NOCOLOR:
-        BRIGHT_GREEN = GREEN = YELLOW = RED = NC = ''
+    colors = _color_palette(nocolor)
+    BRIGHT_GREEN = colors['BRIGHT_GREEN']
+    GREEN = colors['GREEN']
+    YELLOW = colors['YELLOW']
+    RED = colors['RED']
+    NC = colors['NC']
 
     print("\nTracker Response Summary:")
     print("─" * 50)
@@ -309,21 +350,12 @@ def format_table_output(data, show_peers=False, lookup_dns=False):
     # Display response time with color coding
     response_time = data.get('response_time_ms')
     if response_time is not None:
-        if response_time < 150:
-            color = BRIGHT_GREEN
-            speed = "Excellent"
-        elif response_time < 300:
-            color = GREEN
-            speed = "Good"
-        elif response_time < 500:
-            color = YELLOW
-            speed = "OK"
-        else:
-            color = RED
-            speed = "Slow"
+        color, speed = _response_time_color_and_label(response_time, colors)
         print(f"Response Time:     {color}{response_time:>10.2f} ms ({speed}){NC}")
     else:
         print(f"Response Time:     {'N/A':>10}")
+    if data.get('response_encoding'):
+        print(f"Response Encoding: {data['response_encoding']:>10}")
 
     # Display warning message if present
     # example Warning using http://nyaa.tracker.wf:7777/announce
@@ -380,10 +412,6 @@ def format_json_output(data, show_peers=False, lookup_dns=False):
     if not show_peers:
         # Remove peer_list from output if not requested
         data = {k: v for k, v in data.items() if k != 'peer_list'}
-    elif lookup_dns and 'peer_list' in data:
-        # If lookup is enabled, include hostname in output but keep IP for reference
-        # JSON output will have both fields
-        pass
     print(json.dumps(data, indent=2))
 
 def format_csv_output(data, show_peers=False, lookup_dns=False):
@@ -406,18 +434,26 @@ def format_csv_output(data, show_peers=False, lookup_dns=False):
                 peer_id = peer.get('peer_id', '')
                 print(f"{peer['ip']},{peer['port']},{peer['type']},{peer_id}")
 
-def format_scrape_table_output(data):
-    """Format scrape data as a clean aligned table"""
-    # Color codes for batch mode
-    BRIGHT_GREEN = '\033[1;32m'
-    GREEN = '\033[0;32m'
-    YELLOW = '\033[1;33m'
-    RED = '\033[0;31m'
-    NC = '\033[0m'  # No Color
 
-    # Skip colors if not in batch mode or if nocolor flag is set
-    if not data.get('batch_mode') or NOCOLOR:
-        BRIGHT_GREEN = GREEN = YELLOW = RED = NC = ''
+def format_scrape_csv_output(torrents):
+    """Format scrape torrent stats as CSV rows."""
+    print("info_hash,complete,incomplete,downloaded,name")
+    for torrent in torrents:
+        name = str(torrent.get('name', '') or '').replace(',', ';')
+        print(
+            f"{torrent.get('info_hash', '')},{torrent.get('complete', 0)},"
+            f"{torrent.get('incomplete', 0)},{torrent.get('downloaded', 0)},{name}"
+        )
+
+
+def format_scrape_table_output(data, nocolor=None):
+    """Format scrape data as a clean aligned table"""
+    colors = _color_palette(nocolor)
+    BRIGHT_GREEN = colors['BRIGHT_GREEN']
+    GREEN = colors['GREEN']
+    YELLOW = colors['YELLOW']
+    RED = colors['RED']
+    NC = colors['NC']
 
     print("\nScrape Response Summary:")
     print("─" * 50)
@@ -425,21 +461,12 @@ def format_scrape_table_output(data):
     # Display response time with color coding
     response_time = data.get('response_time_ms')
     if response_time is not None:
-        if response_time < 150:
-            color = BRIGHT_GREEN
-            speed = "Excellent"
-        elif response_time < 300:
-            color = GREEN
-            speed = "Good"
-        elif response_time < 500:
-            color = YELLOW
-            speed = "OK"
-        else:
-            color = RED
-            speed = "Slow"
+        color, speed = _response_time_color_and_label(response_time, colors)
         print(f"Response Time:     {color}{response_time:>10.2f} ms ({speed}){NC}")
     else:
         print(f"Response Time:     {'N/A':>10}")
+    if data.get('response_encoding'):
+        print(f"Response Encoding: {data['response_encoding']:>10}")
 
     # Display failure reason if present
     if data.get('failure_reason'):
@@ -478,7 +505,17 @@ def percent_encode_bytes(data: bytes) -> str:
     """
     return ''.join(f'%{b:02X}' for b in data)
 
-def build_announce_url(tracker_url, info_hash_bytes, event, peer_id, num_want, left=1000000000):
+
+def parse_info_hash(hex_str, include_input=False):
+    """Parse and validate a BEP 3 info hash (20-byte SHA-1 hex)."""
+    info_hash_bytes = bytes.fromhex(hex_str)
+    if len(info_hash_bytes) != 20:
+        if include_input:
+            raise ValueError(f"Info hash must be exactly 40 hex characters (20 bytes): {hex_str}")
+        raise ValueError("Info hash must be exactly 40 hex characters (20 bytes)")
+    return info_hash_bytes
+
+def build_announce_url(tracker_url, info_hash_bytes, event, peer_id, num_want, left=DEFAULT_LEFT):
     params = {
         'peer_id':     peer_id,
         'port':        '6881',
@@ -503,14 +540,106 @@ def build_announce_url(tracker_url, info_hash_bytes, event, peer_id, num_want, l
 
     return f"{tracker_url}?info_hash={info_hash_encoded}&{query}"
 
-def test_http_tracker(tracker_url, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want, lookup_dns=False, left=1000000000):
+
+def build_accept_encoding_header(mode):
+    """
+    Build Accept-Encoding header value from one or more CLI values.
+    Supported tokens: all, gzip, deflate, br, zstd, identity
+    Precedence: if 'all' is present anywhere, it overrides all other tokens.
+    Input examples:
+      - 'all'
+      - 'br,gzip'
+      - ['br', 'gzip']
+      - ['br,gzip', 'zstd']
+    """
+    raw_values = mode if isinstance(mode, (list, tuple)) else [mode]
+    tokens = []
+    for raw in raw_values:
+        part = (raw or '').strip()
+        if not part:
+            continue
+        for t in part.split(','):
+            tok = t.strip().lower()
+            if tok:
+                tokens.append(tok)
+
+    if not tokens:
+        tokens = [DEFAULT_ACCEPT_ENCODING]
+
+    if 'all' in tokens:
+        parts = ['gzip', 'deflate']
+        if brotli is not None:
+            parts.append('br')
+        if zstd is not None:
+            parts.append('zstd')
+        return ', '.join(parts)
+
+    allowed = {'gzip', 'deflate', 'br', 'zstd', 'identity'}
+    out = []
+    seen = set()
+    for tok in tokens:
+        if tok not in allowed:
+            raise ValueError(
+                f"Invalid --accept-encoding token '{tok}'. "
+                "Valid tokens: all, gzip, deflate, br, zstd, identity"
+            )
+        if tok == 'br' and brotli is None:
+            raise ValueError(
+                "Cannot request 'br' encoding: 'brotli' module is not installed"
+            )
+        if tok == 'zstd' and zstd is None:
+            raise ValueError(
+                "Cannot request 'zstd' encoding: 'zstandard' module is not installed"
+            )
+        if tok not in seen:
+            out.append(tok)
+            seen.add(tok)
+    return ', '.join(out)
+
+
+def decode_http_body_for_content_encoding(body, content_encoding):
+    enc = (content_encoding or '').strip().lower()
+    if not enc:
+        return body
+    if 'gzip' in enc:
+        return gzip.decompress(body)
+    if 'deflate' in enc:
+        try:
+            # RFC-compliant zlib-wrapped deflate.
+            return zlib.decompress(body)
+        except zlib.error:
+            # Fallback for non-compliant raw deflate streams.
+            return zlib.decompress(body, -zlib.MAX_WBITS)
+    if 'br' in enc:
+        if brotli is None:
+            raise ValueError("Received br-encoded response but 'brotli' module is not installed")
+        return brotli.decompress(body)
+    if 'zstd' in enc:
+        if zstd is None:
+            raise ValueError("Received zstd-encoded response but 'zstandard' module is not installed")
+        dctx = zstd.ZstdDecompressor()
+        try:
+            return dctx.decompress(body)
+        except zstd.ZstdError:
+            # Some trackers emit frames without content size in header.
+            # Fall back to streaming decode for compatibility.
+            with dctx.stream_reader(io.BytesIO(body)) as reader:
+                return reader.read()
+    return body
+
+
+def normalize_response_encoding(content_encoding):
+    enc = (content_encoding or '').strip().lower()
+    if not enc:
+        return 'identity'
+    return enc.split(',', 1)[0].strip() or 'identity'
+
+def test_http_tracker(tracker_url, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want, lookup_dns=False, left=DEFAULT_LEFT, accept_encoding=DEFAULT_ACCEPT_ENCODING, nocolor=None):
     """Test HTTP/HTTPS tracker and return response time in milliseconds"""
     start_time = time.time()
 
     try:
-        info_hash_bytes = bytes.fromhex(info_hash_hex)
-        if len(info_hash_bytes) != 20:
-            raise ValueError("Info hash must be exactly 40 hex characters (20 bytes)")
+        info_hash_bytes = parse_info_hash(info_hash_hex)
     except ValueError as e:
         print(f"Error: Invalid info hash — {e}", file=sys.stderr)
         sys.exit(2)
@@ -525,7 +654,14 @@ def test_http_tracker(tracker_url, info_hash_hex, event, output_format, show_pee
         print(f"Client: {user_agent}")
         print(f"URL: {url[:140]}{'...' if len(url) > 140 else ''}")
 
-    req = urllib.request.Request(url, headers={'User-Agent': user_agent, 'Accept-Encoding': 'gzip'}, method='GET')
+    req = urllib.request.Request(
+        url,
+        headers={
+            'User-Agent': user_agent,
+            'Accept-Encoding': accept_encoding,
+        },
+        method='GET'
+    )
 
     try:
         with urllib.request.urlopen(req, timeout=DEFAULT_TIMEOUT) as resp:
@@ -533,10 +669,9 @@ def test_http_tracker(tracker_url, info_hash_hex, event, output_format, show_pee
             status = resp.getcode()
             body = resp.read()
 
-            # Decompress if tracker honoured our Accept-Encoding: gzip
             content_encoding = resp.getheader('Content-Encoding', '')
-            if 'gzip' in content_encoding.lower():
-                body = gzip.decompress(body)
+            body = decode_http_body_for_content_encoding(body, content_encoding)
+            response_encoding = normalize_response_encoding(content_encoding)
 
             # Only print status for table format
             if output_format == 'table':
@@ -656,6 +791,7 @@ def test_http_tracker(tracker_url, info_hash_hex, event, output_format, show_pee
                     'num_want_requested': num_want,
                     'total_peers_returned': total_peers_returned,
                     'response_time_ms': round(response_time_ms, 2),
+                    'response_encoding': response_encoding,
                     'warning_message': warning_message,
                     'failure_reason': failure_reason,
                     'external_ip': external_ip,
@@ -667,7 +803,7 @@ def test_http_tracker(tracker_url, info_hash_hex, event, output_format, show_pee
                 elif output_format == 'csv':
                     format_csv_output(data, show_peers, lookup_dns)
                 else:  # table
-                    format_table_output(data, show_peers, lookup_dns)
+                    format_table_output(data, show_peers, lookup_dns, nocolor=nocolor)
 
                 # Exit with error if there was a failure reason
                 if failure_reason:
@@ -690,9 +826,9 @@ def test_http_tracker(tracker_url, info_hash_hex, event, output_format, show_pee
         sys.exit(1)
 
     # Return response time for batch mode tracking
-    return round(response_time_ms, 2) if 'response_time_ms' in locals() else None
+    return round(response_time_ms, 2)
 
-def test_http_scrape(tracker_url, info_hash_hex, output_format, show_peers, user_agent):
+def test_http_scrape(tracker_url, info_hash_hex, output_format, user_agent, accept_encoding=DEFAULT_ACCEPT_ENCODING, nocolor=None):
     """Test HTTP/HTTPS tracker scrape endpoint and return response time in milliseconds
 
     info_hash_hex can be:
@@ -717,9 +853,7 @@ def test_http_scrape(tracker_url, info_hash_hex, output_format, show_peers, user
         info_hash_list = []
         for hash_hex in info_hash_hex:
             try:
-                hash_bytes = bytes.fromhex(hash_hex)
-                if len(hash_bytes) != 20:
-                    raise ValueError(f"Info hash must be exactly 40 hex characters (20 bytes): {hash_hex}")
+                hash_bytes = parse_info_hash(hash_hex, include_input=True)
                 info_hash_list.append(hash_bytes)
             except ValueError as e:
                 print(f"Error: Invalid info hash — {e}", file=sys.stderr)
@@ -735,9 +869,7 @@ def test_http_scrape(tracker_url, info_hash_hex, output_format, show_peers, user
     else:
         # Single hash
         try:
-            info_hash_bytes = bytes.fromhex(info_hash_hex)
-            if len(info_hash_bytes) != 20:
-                raise ValueError("Info hash must be exactly 40 hex characters (20 bytes)")
+            info_hash_bytes = parse_info_hash(info_hash_hex)
             info_hash_list = [info_hash_bytes]
         except ValueError as e:
             print(f"Error: Invalid info hash — {e}", file=sys.stderr)
@@ -760,7 +892,14 @@ def test_http_scrape(tracker_url, info_hash_hex, output_format, show_peers, user
             print(f"Scraping {hash_count} torrent{'s' if hash_count > 1 else ''}")
         print(f"Scrape URL: {full_url[:120]}{'...' if len(full_url) > 120 else ''}")
 
-    req = urllib.request.Request(full_url, headers={'User-Agent': user_agent, 'Accept-Encoding': 'gzip'}, method='GET')
+    req = urllib.request.Request(
+        full_url,
+        headers={
+            'User-Agent': user_agent,
+            'Accept-Encoding': accept_encoding,
+        },
+        method='GET'
+    )
 
     try:
         with urllib.request.urlopen(req, timeout=DEFAULT_TIMEOUT) as resp:
@@ -768,10 +907,9 @@ def test_http_scrape(tracker_url, info_hash_hex, output_format, show_peers, user
             status = resp.getcode()
             body = resp.read()
 
-            # Decompress if tracker honoured our Accept-Encoding: gzip
             content_encoding = resp.getheader('Content-Encoding', '')
-            if 'gzip' in content_encoding.lower():
-                body = gzip.decompress(body)
+            body = decode_http_body_for_content_encoding(body, content_encoding)
+            response_encoding = normalize_response_encoding(content_encoding)
 
             # Only print status for table format
             if output_format == 'table':
@@ -830,6 +968,7 @@ def test_http_scrape(tracker_url, info_hash_hex, output_format, show_peers, user
                     'tracker': tracker_url,
                     'scrape_url': scrape_url,
                     'response_time_ms': round(response_time_ms, 2),
+                    'response_encoding': response_encoding,
                     'failure_reason': failure_reason,
                     'min_request_interval': min_request_interval,
                     'torrents': torrents,
@@ -839,15 +978,9 @@ def test_http_scrape(tracker_url, info_hash_hex, output_format, show_peers, user
                 if output_format == 'json':
                     print(json.dumps(data, indent=2))
                 elif output_format == 'csv':
-                    # CSV header
-                    print("info_hash,complete,incomplete,downloaded,name")
-                    for torrent in torrents:
-                        name = torrent.get('name', '')
-                        # Escape commas in name
-                        name = name.replace(',', ';')
-                        print(f"{torrent['info_hash']},{torrent['complete']},{torrent['incomplete']},{torrent['downloaded']},{name}")
+                    format_scrape_csv_output(torrents)
                 else:  # table
-                    format_scrape_table_output(data)
+                    format_scrape_table_output(data, nocolor=nocolor)
 
                 # Exit with error if there was a failure reason
                 if failure_reason:
@@ -870,7 +1003,7 @@ def test_http_scrape(tracker_url, info_hash_hex, output_format, show_peers, user
         sys.exit(1)
 
     # Return response time for batch mode tracking
-    return round(response_time_ms, 2) if 'response_time_ms' in locals() else None
+    return round(response_time_ms, 2)
 
 def parse_udp_url(tracker_url):
     """Parse UDP tracker URL and return (hostname, port)"""
@@ -885,6 +1018,28 @@ def parse_udp_url(tracker_url):
         raise ValueError("Invalid UDP tracker URL - no hostname")
 
     return hostname, port
+
+
+def resolve_udp_socket_and_addr(hostname, port, output_format):
+    """Resolve UDP endpoint and return (sock, addr, family)."""
+    try:
+        addr_info = socket.getaddrinfo(hostname, port, socket.AF_UNSPEC, socket.SOCK_DGRAM)
+        if not addr_info:
+            if output_format == 'table':
+                print(f"DNS resolution failed: No address found for {hostname}")
+            sys.exit(1)
+        family, _, _, _, sockaddr = addr_info[0]
+        addr = sockaddr
+        if output_format == 'table':
+            print(f"Resolved to: {sockaddr[0]} ({'IPv6' if family == socket.AF_INET6 else 'IPv4'})")
+    except socket.gaierror as e:
+        if output_format == 'table':
+            print(f"DNS resolution failed: {e}")
+        sys.exit(1)
+
+    sock = socket.socket(family, socket.SOCK_DGRAM)
+    sock.settimeout(DEFAULT_TIMEOUT)
+    return sock, addr, family
 
 def udp_connect(sock, addr, transaction_id):
     """Send UDP connect request and return connection_id"""
@@ -912,7 +1067,7 @@ def udp_connect(sock, addr, transaction_id):
 
     return connection_id
 
-def udp_announce(sock, addr, connection_id, transaction_id, info_hash_bytes, event, peer_id, num_want, left=1000000000):
+def udp_announce(sock, addr, connection_id, transaction_id, info_hash_bytes, event, peer_id, num_want, left=DEFAULT_LEFT):
     """Send UDP announce request and return parsed response"""
     # Map event string to UDP event codes
     event_map = {'started': 2, 'completed': 1, 'stopped': 3, 'none': 0}
@@ -1022,7 +1177,7 @@ def udp_scrape(sock, addr, connection_id, transaction_id, info_hash_list):
 
     return stats
 
-def test_udp_scrape(tracker_url, info_hash_hex, output_format, user_agent):
+def test_udp_scrape(tracker_url, info_hash_hex, output_format, user_agent, nocolor=None):
     """Test UDP tracker scrape endpoint and return response time in milliseconds."""
     start_time = time.time()
 
@@ -1040,9 +1195,7 @@ def test_udp_scrape(tracker_url, info_hash_hex, output_format, user_agent):
     info_hash_list = []
     for hash_hex in hash_inputs:
         try:
-            hash_bytes = bytes.fromhex(hash_hex)
-            if len(hash_bytes) != 20:
-                raise ValueError(f"Info hash must be exactly 40 hex characters (20 bytes): {hash_hex}")
+            hash_bytes = parse_info_hash(hash_hex, include_input=True)
             info_hash_list.append(hash_bytes)
         except ValueError as e:
             print(f"Error: Invalid info hash — {e}", file=sys.stderr)
@@ -1062,23 +1215,7 @@ def test_udp_scrape(tracker_url, info_hash_hex, output_format, user_agent):
         print(f"Scraping {len(info_hash_list)} torrent{'s' if len(info_hash_list) > 1 else ''}")
         print(f"Connecting to: {hostname}:{port}")
 
-    try:
-        addr_info = socket.getaddrinfo(hostname, port, socket.AF_UNSPEC, socket.SOCK_DGRAM)
-        if not addr_info:
-            if output_format == 'table':
-                print(f"DNS resolution failed: No address found for {hostname}")
-            sys.exit(1)
-        family, _, _, _, sockaddr = addr_info[0]
-        addr = sockaddr
-        if output_format == 'table':
-            print(f"Resolved to: {sockaddr[0]} ({'IPv6' if family == socket.AF_INET6 else 'IPv4'})")
-    except socket.gaierror as e:
-        if output_format == 'table':
-            print(f"DNS resolution failed: {e}")
-        sys.exit(1)
-
-    sock = socket.socket(family, socket.SOCK_DGRAM)
-    sock.settimeout(DEFAULT_TIMEOUT)
+    sock, addr, family = resolve_udp_socket_and_addr(hostname, port, output_format)
 
     try:
         # Step 1: Connect
@@ -1123,6 +1260,7 @@ def test_udp_scrape(tracker_url, info_hash_hex, output_format, user_agent):
             'tracker': tracker_url,
             'scrape_url': tracker_url,
             'response_time_ms': round(response_time_ms, 2),
+            'response_encoding': None,
             'failure_reason': None,
             'min_request_interval': None,
             'torrents': torrents,
@@ -1132,28 +1270,21 @@ def test_udp_scrape(tracker_url, info_hash_hex, output_format, user_agent):
         if output_format == 'json':
             print(json.dumps(data, indent=2))
         elif output_format == 'csv':
-            print("info_hash,complete,incomplete,downloaded,name")
-            for torrent in torrents:
-                print(
-                    f"{torrent['info_hash']},{torrent['complete']},"
-                    f"{torrent['incomplete']},{torrent['downloaded']},{torrent['name']}"
-                )
+            format_scrape_csv_output(torrents)
         else:  # table
-            format_scrape_table_output(data)
+            format_scrape_table_output(data, nocolor=nocolor)
 
     finally:
         sock.close()
 
-    return round(response_time_ms, 2) if 'response_time_ms' in locals() else None
+    return round(response_time_ms, 2)
 
-def test_udp_tracker(tracker_url, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want, lookup_dns=False, left=1000000000):
+def test_udp_tracker(tracker_url, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want, lookup_dns=False, left=DEFAULT_LEFT, nocolor=None):
     """Test UDP tracker and return response time in milliseconds"""
     start_time = time.time()
 
     try:
-        info_hash_bytes = bytes.fromhex(info_hash_hex)
-        if len(info_hash_bytes) != 20:
-            raise ValueError("Info hash must be exactly 40 hex characters (20 bytes)")
+        info_hash_bytes = parse_info_hash(info_hash_hex)
     except ValueError as e:
         print(f"Error: Invalid info hash — {e}", file=sys.stderr)
         sys.exit(2)
@@ -1172,31 +1303,9 @@ def test_udp_tracker(tracker_url, info_hash_hex, event, output_format, show_peer
         print(f"Client: {user_agent}")
         print(f"Connecting to: {hostname}:{port}")
 
-    # Resolve hostname to determine IP version
-    try:
-        addr_info = socket.getaddrinfo(hostname, port, socket.AF_UNSPEC, socket.SOCK_DGRAM)
-        if not addr_info:
-            if output_format == 'table':
-                print(f"DNS resolution failed: No address found for {hostname}")
-            sys.exit(1)
-
-        # Use the first available address
-        family, socktype, proto, canonname, sockaddr = addr_info[0]
-        addr = sockaddr
-
-        # Determine if IPv4 or IPv6
-        is_ipv6 = family == socket.AF_INET6
-        if output_format == 'table':
-            print(f"Resolved to: {sockaddr[0]} ({'IPv6' if is_ipv6 else 'IPv4'})")
-
-    except socket.gaierror as e:
-        if output_format == 'table':
-            print(f"DNS resolution failed: {e}")
-        sys.exit(1)
-
-    # Create UDP socket with appropriate family
-    sock = socket.socket(family, socket.SOCK_DGRAM)
-    sock.settimeout(DEFAULT_TIMEOUT)
+    # Resolve endpoint and determine IP version
+    sock, addr, family = resolve_udp_socket_and_addr(hostname, port, output_format)
+    is_ipv6 = family == socket.AF_INET6
 
     try:
         # Generate transaction ID
@@ -1288,7 +1397,7 @@ def test_udp_tracker(tracker_url, info_hash_hex, event, output_format, show_peer
         data = {
             'tracker': tracker_url,
             'interval': announce_response['interval'],
-            'min_interval': announce_response['interval'],  # UDP has no min_interval
+            'min_interval': '?',  # UDP has no min_interval
             'seeds': announce_response['seeders'],
             'leechers': announce_response['leechers'],
             'downloaded': '?',
@@ -1311,22 +1420,25 @@ def test_udp_tracker(tracker_url, info_hash_hex, event, output_format, show_peer
         elif output_format == 'csv':
             format_csv_output(data, show_peers, lookup_dns)
         else:  # table
-            format_table_output(data, show_peers, lookup_dns)
+            format_table_output(data, show_peers, lookup_dns, nocolor=nocolor)
         
     finally:
         sock.close()
 
     # Return response time for batch mode tracking
-    return round(response_time_ms, 2) if 'response_time_ms' in locals() else None
+    return round(response_time_ms, 2)
 
 # ────────────────────────────────────────────────
 # Main dispatcher
 # ────────────────────────────────────────────────
 
-def test_tracker(tracker_url, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want, scrape=False, lookup_dns=False, left=1000000000):
+def test_tracker(tracker_url, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want, scrape=False, lookup_dns=False, left=DEFAULT_LEFT, accept_encoding=DEFAULT_ACCEPT_ENCODING, nocolor=None):
     """Route to HTTP or UDP tracker based on URL scheme (returns (success, response_time) for batch mode)"""
     try:
-        response_time = _test_tracker_impl(tracker_url, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want, scrape, lookup_dns, left)
+        response_time = _test_tracker_impl(
+            tracker_url, info_hash_hex, event, output_format, show_peers,
+            user_agent, peer_id, num_want, scrape, lookup_dns, left, accept_encoding, nocolor
+        )
         return True, response_time
     except SystemExit as e:
         # Catch sys.exit() calls and convert to return value
@@ -1335,20 +1447,30 @@ def test_tracker(tracker_url, info_hash_hex, event, output_format, show_peers, u
         print(f"Error: {e}", file=sys.stderr)
         return False, None
 
-def _test_tracker_impl(tracker_url, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want, scrape=False, lookup_dns=False, left=1000000000):
+def _test_tracker_impl(tracker_url, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want, scrape=False, lookup_dns=False, left=DEFAULT_LEFT, accept_encoding=DEFAULT_ACCEPT_ENCODING, nocolor=None):
     """Internal implementation - routes to HTTP or UDP tracker based on URL scheme, returns response_time"""
     parsed = urllib.parse.urlparse(tracker_url)
     scheme = parsed.scheme.lower()
     
     if scheme in ('http', 'https'):
         if scrape:
-            return test_http_scrape(tracker_url, info_hash_hex, output_format, show_peers, user_agent)
+            return test_http_scrape(
+                tracker_url, info_hash_hex, output_format, user_agent,
+                accept_encoding, nocolor=nocolor
+            )
         else:
-            return test_http_tracker(tracker_url, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want, lookup_dns, left)
+            return test_http_tracker(
+                tracker_url, info_hash_hex, event, output_format, show_peers,
+                user_agent, peer_id, num_want, lookup_dns, left, accept_encoding,
+                nocolor=nocolor
+            )
     elif scheme == 'udp':
         if scrape:
-            return test_udp_scrape(tracker_url, info_hash_hex, output_format, user_agent)
-        return test_udp_tracker(tracker_url, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want, lookup_dns, left)
+            return test_udp_scrape(tracker_url, info_hash_hex, output_format, user_agent, nocolor=nocolor)
+        return test_udp_tracker(
+            tracker_url, info_hash_hex, event, output_format, show_peers,
+            user_agent, peer_id, num_want, lookup_dns, left, nocolor=nocolor
+        )
     else:
         print(f"Error: Unsupported tracker scheme '{scheme}'. Only http, https, and udp are supported.", file=sys.stderr)
         sys.exit(2)
@@ -1357,18 +1479,15 @@ def _test_tracker_impl(tracker_url, info_hash_hex, event, output_format, show_pe
 # Batch mode functionality
 # ────────────────────────────────────────────────
 
-def batch_query_trackers(tracker_file, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want, delay, random_qb, scrape=False, lookup_dns=False, left=1000000000):
+def batch_query_trackers(tracker_file, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want, delay, random_qb, scrape=False, lookup_dns=False, left=DEFAULT_LEFT, accept_encoding=DEFAULT_ACCEPT_ENCODING, nocolor=None):
     """Query multiple trackers from a file"""
-    # Color codes
-    RED = '\033[0;31m'
-    GREEN = '\033[0;32m'
-    YELLOW = '\033[1;33m'
-    BLUE = '\033[0;34m'
-    NC = '\033[0m'  # No Color
-
-    # Disable colors if NOCOLOR flag is set
-    if NOCOLOR:
-        RED = GREEN = YELLOW = BLUE = NC = ''
+    colors = _color_palette(nocolor)
+    BRIGHT_GREEN = colors['BRIGHT_GREEN']
+    GREEN = colors['GREEN']
+    YELLOW = colors['YELLOW']
+    RED = colors['RED']
+    BLUE = colors['BLUE']
+    NC = colors['NC']
 
     # Read and count trackers
     try:
@@ -1426,7 +1545,11 @@ def batch_query_trackers(tracker_file, info_hash_hex, event, output_format, show
             user_agent, peer_id = get_random_qb_client()
 
         # Query the tracker - use table format always in batch mode
-        success, response_time = test_tracker(tracker, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want, scrape, lookup_dns)
+        success, response_time = test_tracker(
+            tracker, info_hash_hex, event, output_format, show_peers, user_agent,
+            peer_id, num_want, scrape, lookup_dns, left, accept_encoding,
+            nocolor=nocolor
+        )
 
         if success:
             success_count += 1
@@ -1471,14 +1594,7 @@ def batch_query_trackers(tracker_file, info_hash_hex, event, output_format, show
         for tracker, resp_time in success_list:
             if resp_time is not None:
                 # Color code based on speed (4-tier system)
-                if resp_time < 150:
-                    time_color = '\033[1;32m'  # Bright Green (Excellent)
-                elif resp_time < 300:
-                    time_color = GREEN  # Green (Good)
-                elif resp_time < 500:
-                    time_color = YELLOW  # Yellow (OK)
-                else:
-                    time_color = RED  # Red (Slow)
+                time_color, _ = _response_time_color_and_label(resp_time, colors)
                 print(f"  {time_color}{resp_time:>7.2f}ms{NC}  {tracker}")
             else:
                 print(f"  {'    N/A':>10}  {tracker}")
@@ -1501,7 +1617,7 @@ def batch_query_trackers(tracker_file, info_hash_hex, event, output_format, show
 # Retry Logic
 # ────────────────────────────────────────────────
 
-def test_tracker_with_retry(tracker_url, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want, scrape, lookup_dns, max_attempts, left=1000000000):
+def test_tracker_with_retry(tracker_url, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want, scrape, lookup_dns, max_attempts, left=DEFAULT_LEFT, accept_encoding=DEFAULT_ACCEPT_ENCODING, nocolor=None):
     """
     Retry tracker connection until successful.
 
@@ -1512,15 +1628,12 @@ def test_tracker_with_retry(tracker_url, info_hash_hex, event, output_format, sh
     Returns:
         (success, response_time) tuple from successful attempt, or (False, None) if max attempts reached
     """
-    # Color codes
-    YELLOW = '\033[1;33m'
-    GREEN = '\033[0;32m'
-    RED = '\033[0;31m'
-    BLUE = '\033[0;34m'
-    NC = '\033[0m'
-
-    if NOCOLOR:
-        YELLOW = GREEN = RED = BLUE = NC = ''
+    colors = _color_palette(nocolor)
+    GREEN = colors['GREEN']
+    YELLOW = colors['YELLOW']
+    RED = colors['RED']
+    BLUE = colors['BLUE']
+    NC = colors['NC']
 
     attempt = 0
     retry_delay = 2  # seconds between retries
@@ -1535,7 +1648,11 @@ def test_tracker_with_retry(tracker_url, info_hash_hex, event, output_format, sh
             print(f"\n{BLUE}[Attempt {attempt}]{NC}")
 
         # Try to connect
-        success, response_time = test_tracker(tracker_url, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want, scrape, lookup_dns, left)
+        success, response_time = test_tracker(
+            tracker_url, info_hash_hex, event, output_format, show_peers,
+            user_agent, peer_id, num_want, scrape, lookup_dns, left, accept_encoding,
+            nocolor=nocolor
+        )
 
         if success:
             print(f"\n{GREEN}✓ Connection successful after {attempt} attempt(s)!{NC}")
@@ -1594,7 +1711,7 @@ def main():
         metavar='FORMAT',
         choices=['table', 'json', 'csv'],
         default='table',
-        help="Output format: table, json, or csv."
+        help="Output format (choices: table, json, csv)."
     )
 
     parser.add_argument(
@@ -1635,7 +1752,7 @@ def main():
         metavar='BYTES',
         type=int,
         default=None,
-        help="Bytes remaining to download. Defaults to 0 for --event completed, 1000000000 otherwise. Use 0 to announce as a seeder."
+        help=f"Bytes remaining to download. Defaults to 0 for --event completed, {DEFAULT_LEFT} otherwise. Use 0 to announce as a seeder."
     )
 
     parser.add_argument(
@@ -1650,6 +1767,16 @@ def main():
         '--nocolor',
         action='store_true',
         help="Disable colored output (useful for redirecting to files)"
+    )
+
+    parser.add_argument(
+        '-a', '--accept-encoding',
+        metavar='MODE',
+        action='append',
+        default=[],
+        help="HTTP Accept-Encoding tokens (choices: all,gzip,deflate,br,zstd,identity). "
+             "Repeat or comma-separate values (examples: -a br -a gzip, -a br,gzip). "
+             "If 'all' is included, it overrides all other tokens. UDP unaffected."
     )
 
     parser.add_argument(
@@ -1674,6 +1801,12 @@ def main():
     )
 
     args = parser.parse_args()
+
+    try:
+        args.accept_encoding = build_accept_encoding_header(args.accept_encoding)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(2)
 
     # Set global NOCOLOR flag
     global NOCOLOR
@@ -1713,7 +1846,7 @@ def main():
     elif args.event == 'completed':
         left = 0
     else:
-        left = 1000000000
+        left = DEFAULT_LEFT
 
     # Determine client info
     if args.random_qb:
@@ -1724,16 +1857,29 @@ def main():
 
     # Run batch or single mode
     if args.batch:
-        batch_query_trackers(args.file, info_hash, args.event, args.format, args.show_peers, user_agent, peer_id, args.num_want, args.delay, args.random_qb, args.scrape, args.lookup, left)
+        batch_query_trackers(
+            args.file, info_hash, args.event, args.format, args.show_peers,
+            user_agent, peer_id, args.num_want, args.delay, args.random_qb,
+            args.scrape, args.lookup, left, args.accept_encoding,
+            nocolor=args.nocolor
+        )
     else:
         # Single tracker mode
         if args.retry is not None:
             # Retry mode: retry until success or max attempts
             max_attempts = args.retry if args.retry > 0 else 0  # 0 means infinite
-            success, response_time = test_tracker_with_retry(args.tracker, info_hash, args.event, args.format, args.show_peers, user_agent, peer_id, args.num_want, args.scrape, args.lookup, max_attempts, left)
+            success, response_time = test_tracker_with_retry(
+                args.tracker, info_hash, args.event, args.format, args.show_peers,
+                user_agent, peer_id, args.num_want, args.scrape, args.lookup,
+                max_attempts, left, args.accept_encoding, nocolor=args.nocolor
+            )
         else:
             # Normal mode: single attempt
-            success, response_time = test_tracker(args.tracker, info_hash, args.event, args.format, args.show_peers, user_agent, peer_id, args.num_want, args.scrape, args.lookup, left)
+            success, response_time = test_tracker(
+                args.tracker, info_hash, args.event, args.format, args.show_peers,
+                user_agent, peer_id, args.num_want, args.scrape, args.lookup,
+                left, args.accept_encoding, nocolor=args.nocolor
+            )
         sys.exit(0 if success else 1)
 
 if __name__ == '__main__':
