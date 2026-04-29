@@ -1,11 +1,11 @@
-usage: tracker_query.py [-h] [-b] [-t URL] [-H HEX] [-e EVENT] [-o FORMAT] [-f FILE] [-p] [-l] [-r] [-n NUM] [-L BYTES] [-d SECONDS] [--nocolor] [-a MODE] [-s] [--full-scrape] [-R [COUNT]]
+usage: tracker_query.py [-h] [-b] [-t URL] [-H HEX] [-e EVENT] [-o FORMAT] [-f FILE] [-p] [-l] [-r] [-n NUM] [-L BYTES] [-d SECONDS] [--nocolor] [-a MODE] [-s] [--full-scrape] [-R [COUNT]] [--bep34 {off,prefer,strict}]
 
 Query a BitTorrent tracker announce endpoint and display swarm info (seeds, leechers, peers). Supports HTTP/HTTPS and UDP trackers, as well as scrape requests.
 
 optional arguments:
   -h, --help                    show this help message and exit
   -b, --batch                   Enable batch mode to query multiple trackers from a file (ignores --tracker) (default: False)
-  -t URL, --tracker URL         Tracker announce URL (http://, https://, or udp://). Ignored in batch mode. (default: http://lucke.fenesisu.moe:6969/announce)
+  -t URL, --tracker URL         Tracker announce URL (http://, https://, or udp://). Ignored in batch mode. (default: udp://tracker.opentrackr.org:6969/announce)
   -H HEX, --hash HEX            Info hash (40 hex characters). Can be specified multiple times for scrape mode to query multiple torrents. (default: None)
   -e EVENT, --event EVENT       Announce event type (choices: started, completed, stopped, none). Ignored in scrape mode. (default: started)
   -o FORMAT, --format FORMAT    Output format (choices: table, json, csv). (default: table)
@@ -22,3 +22,4 @@ optional arguments:
   -s, --scrape                  Use scrape endpoint instead of announce. Supports HTTP/HTTPS and UDP trackers (UDP requires --hash; no full scrape). (default: False)
   --full-scrape                 Scrape with no info_hash (implies --scrape). Tests if tracker allows full scrape. (default: False)
   -R [COUNT], --retry [COUNT]   Retry connection until successful. Specify COUNT for max attempts (e.g., --retry 5 or -R 5), or omit for infinite retries (e.g., --retry or -R). Only works in single-tracker mode. (default: None)
+  --bep34 {off,prefer,strict}   BEP34 DNS TXT handling: off=disabled, prefer=try TXT-advertised endpoints first, strict=only allow TXT-advertised endpoints. (default: prefer)
