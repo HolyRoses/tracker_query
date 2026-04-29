@@ -35,6 +35,13 @@ import time
 import os
 
 try:
+    import dns.resolver  # type: ignore
+    from dns.exception import DNSException  # type: ignore
+except Exception:
+    dns = None
+    DNSException = Exception
+
+try:
     import brotli  # type: ignore
 except Exception:
     brotli = None
@@ -54,7 +61,7 @@ except Exception:
 NOCOLOR = False
 
 DEFAULT_INFO_HASH_HEX = '5CB6C44712D494A87E8554839FB0541046B157AF'
-DEFAULT_TRACKER       = 'http://lucke.fenesisu.moe:6969/announce'
+DEFAULT_TRACKER       = 'udp://tracker.opentrackr.org:6969/announce'
 DEFAULT_PEER_ID       = b'-qB5140-' + os.urandom(12)
 DEFAULT_USER_AGENT    = "qBittorrent/5.1.4"
 DEFAULT_TIMEOUT       = 12
@@ -197,6 +204,173 @@ def convert_announce_to_scrape(announce_url):
     ))
 
     return scrape_url, None
+
+
+def _bep34_parse_txt_record(record_text):
+    """
+    Parse a BEP34 TXT record.
+    Returns list of (proto, port) preferences in record order.
+    Unknown tokens are ignored.
+    """
+    prefs = []
+    tokens = record_text.split()
+    # BEP34 sentinel is specified as exact uppercase "BITTORRENT".
+    if not tokens or tokens[0] != 'BITTORRENT':
+        return prefs
+    for token in tokens[1:]:
+        upper = token.upper()
+        if upper.startswith('UDP:'):
+            port_s = token[4:]
+            if port_s.isdigit():
+                port = int(port_s)
+                if 1 <= port <= 65535:
+                    prefs.append(('udp', port))
+        elif upper.startswith('TCP:'):
+            port_s = token[4:]
+            if port_s.isdigit():
+                port = int(port_s)
+                if 1 <= port <= 65535:
+                    prefs.append(('tcp', port))
+    return prefs
+
+
+def _bep34_lookup_prefs(hostname):
+    """
+    Returns (has_bep34_record, prefs, error_message).
+    - has_bep34_record=True means a BITTORRENT TXT record exists.
+    - prefs is ordered protocol preferences (may be empty to explicitly deny trackers).
+    """
+    if not hostname:
+        return False, [], None
+    if dns is None:
+        return False, [], "dnspython not installed (pip install dnspython)"
+    try:
+        answer = dns.resolver.resolve(hostname, "TXT")
+    except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN):
+        # No TXT answer / host missing -> treat as no BEP34 record, not a warning-worthy failure.
+        return False, [], None
+    except DNSException as e:
+        return False, [], f"DNS TXT lookup failed: {e}"
+
+    try:
+        for rdata in answer:
+            try:
+                # dnspython may return split strings; join then decode to text.
+                # If one unrelated TXT record is malformed, skip it and keep searching.
+                parts = []
+                for p in getattr(rdata, "strings", []):
+                    if isinstance(p, bytes):
+                        parts.append(p.decode("utf-8", errors="ignore"))
+                    else:
+                        parts.append(str(p))
+                record_text = "".join(parts).strip()
+            except Exception:
+                continue
+            if record_text.startswith("BITTORRENT"):
+                # Keep parse outside the decode/shape try-block so future parser changes
+                # do not silently turn a detected BEP34 record into "no record".
+                return True, _bep34_parse_txt_record(record_text), None
+    except Exception as e:
+        return False, [], f"DNS TXT iteration failed: {e}"
+    return False, [], None
+
+
+def _bep34_build_candidate_urls(tracker_url, prefs):
+    parsed = urllib.parse.urlparse(tracker_url)
+    host = parsed.hostname
+    if not host:
+        return []
+    # urlparse().hostname strips IPv6 brackets; add them back for netloc rebuild.
+    host_for_netloc = f"[{host}]" if ':' in host and not host.startswith('[') else host
+    path = parsed.path or "/announce"
+    candidates = []
+    for proto, port in prefs:
+        netloc = f"{host_for_netloc}:{port}"
+        if proto == 'udp':
+            candidate = urllib.parse.urlunparse(('udp', netloc, path, '', '', ''))
+        else:
+            # For TCP preference, keep secure scheme if original was https; otherwise use http.
+            scheme = 'https' if parsed.scheme.lower() == 'https' else 'http'
+            candidate = urllib.parse.urlunparse((scheme, netloc, path, parsed.params, parsed.query, parsed.fragment))
+        if candidate not in candidates:
+            candidates.append(candidate)
+    return candidates
+
+
+def _bep34_resolve_targets(tracker_url, bep34_mode):
+    """
+    Return (targets, strict_record_seen, error_message)
+    targets: tracker URLs to attempt in order.
+    """
+    mode = (bep34_mode or 'off').lower()
+    if mode == 'off':
+        return [tracker_url], False, None
+
+    parsed = urllib.parse.urlparse(tracker_url)
+    has_record, prefs, err = _bep34_lookup_prefs(parsed.hostname)
+
+    if mode == 'strict':
+        if err:
+            return [], has_record, f"BEP34 strict mode: {err}"
+        if not has_record:
+            return [], False, "BEP34 strict mode: no BITTORRENT TXT record found"
+        if not prefs:
+            return [], True, "BEP34 strict mode: host denies trackers (BITTORRENT with no endpoints)"
+        return _bep34_build_candidate_urls(tracker_url, prefs), True, None
+
+    # prefer mode
+    if err:
+        return [tracker_url], False, f"BEP34 prefer mode fallback: {err}"
+    if has_record:
+        candidates = _bep34_build_candidate_urls(tracker_url, prefs)
+        if candidates:
+            # Try BEP34-advertised endpoint(s), then fallback to submitted URL.
+            return candidates + [tracker_url], True, None
+        # Explicit deny/no endpoints -> fallback to original in prefer mode.
+        return [tracker_url], True, None
+
+    # No BEP34 record in prefer mode: best effort fallback.
+    return [tracker_url], False, None
+
+
+class _SysExitFailure(Exception):
+    """Internal marker for per-target sys.exit(non-zero) failures."""
+    pass
+
+
+def _should_emit_attempt_error(last_error):
+    """Emit only meaningful exceptions; suppress internal sys.exit markers."""
+    return last_error is not None and not isinstance(last_error, _SysExitFailure)
+
+
+def _attempt_tracker_targets(
+    targets, info_hash_hex, event, output_format, show_peers,
+    user_agent, peer_id, num_want, scrape=False, lookup_dns=False,
+    left=DEFAULT_LEFT, accept_encoding=DEFAULT_ACCEPT_ENCODING, nocolor=None
+):
+    """
+    Try tracker targets in order and return (success, response_time, last_error).
+    Catches SystemExit per-target so BEP34 fallbacks are attempted.
+    """
+    last_error = None
+    for target in targets:
+        try:
+            response_time = _test_tracker_impl(
+                target, info_hash_hex, event, output_format, show_peers,
+                user_agent, peer_id, num_want, scrape, lookup_dns, left, accept_encoding, nocolor
+            )
+            return True, response_time, None
+        except SystemExit as e:
+            if e.code == 0:
+                return True, None, None
+            # _test_tracker_impl prints its own user-facing failure context before sys.exit().
+            # Keep a sentinel for control flow but avoid adding noisy duplicate error output.
+            last_error = _SysExitFailure()
+            continue
+        except Exception as e:
+            last_error = e
+            continue
+    return False, None, last_error
 
 # ────────────────────────────────────────────────
 # Simple bencode decoder
@@ -1432,17 +1606,26 @@ def test_udp_tracker(tracker_url, info_hash_hex, event, output_format, show_peer
 # Main dispatcher
 # ────────────────────────────────────────────────
 
-def test_tracker(tracker_url, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want, scrape=False, lookup_dns=False, left=DEFAULT_LEFT, accept_encoding=DEFAULT_ACCEPT_ENCODING, nocolor=None):
+def test_tracker(tracker_url, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want, scrape=False, lookup_dns=False, left=DEFAULT_LEFT, accept_encoding=DEFAULT_ACCEPT_ENCODING, nocolor=None, bep34='prefer'):
     """Route to HTTP or UDP tracker based on URL scheme (returns (success, response_time) for batch mode)"""
     try:
-        response_time = _test_tracker_impl(
-            tracker_url, info_hash_hex, event, output_format, show_peers,
-            user_agent, peer_id, num_want, scrape, lookup_dns, left, accept_encoding, nocolor
+        targets, _, err = _bep34_resolve_targets(tracker_url, bep34)
+        if err and not targets:
+            print(f"Error: {err}", file=sys.stderr)
+            return False, None
+        if err:
+            print(f"Warning: {err}", file=sys.stderr)
+
+        success, response_time, last_error = _attempt_tracker_targets(
+            targets, info_hash_hex, event, output_format, show_peers,
+            user_agent, peer_id, num_want, scrape, lookup_dns, left,
+            accept_encoding, nocolor
         )
-        return True, response_time
-    except SystemExit as e:
-        # Catch sys.exit() calls and convert to return value
-        return (e.code == 0), None
+        if success:
+            return True, response_time
+        if _should_emit_attempt_error(last_error):
+            print(f"Error: {last_error}", file=sys.stderr)
+        return False, None
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
         return False, None
@@ -1479,7 +1662,7 @@ def _test_tracker_impl(tracker_url, info_hash_hex, event, output_format, show_pe
 # Batch mode functionality
 # ────────────────────────────────────────────────
 
-def batch_query_trackers(tracker_file, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want, delay, random_qb, scrape=False, lookup_dns=False, left=DEFAULT_LEFT, accept_encoding=DEFAULT_ACCEPT_ENCODING, nocolor=None):
+def batch_query_trackers(tracker_file, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want, delay, random_qb, scrape=False, lookup_dns=False, left=DEFAULT_LEFT, accept_encoding=DEFAULT_ACCEPT_ENCODING, nocolor=None, bep34='prefer'):
     """Query multiple trackers from a file"""
     colors = _color_palette(nocolor)
     BRIGHT_GREEN = colors['BRIGHT_GREEN']
@@ -1548,7 +1731,7 @@ def batch_query_trackers(tracker_file, info_hash_hex, event, output_format, show
         success, response_time = test_tracker(
             tracker, info_hash_hex, event, output_format, show_peers, user_agent,
             peer_id, num_want, scrape, lookup_dns, left, accept_encoding,
-            nocolor=nocolor
+            nocolor=nocolor, bep34=bep34
         )
 
         if success:
@@ -1617,7 +1800,7 @@ def batch_query_trackers(tracker_file, info_hash_hex, event, output_format, show
 # Retry Logic
 # ────────────────────────────────────────────────
 
-def test_tracker_with_retry(tracker_url, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want, scrape, lookup_dns, max_attempts, left=DEFAULT_LEFT, accept_encoding=DEFAULT_ACCEPT_ENCODING, nocolor=None):
+def test_tracker_with_retry(tracker_url, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want, scrape, lookup_dns, max_attempts, left=DEFAULT_LEFT, accept_encoding=DEFAULT_ACCEPT_ENCODING, nocolor=None, bep34='prefer'):
     """
     Retry tracker connection until successful.
 
@@ -1637,6 +1820,14 @@ def test_tracker_with_retry(tracker_url, info_hash_hex, event, output_format, sh
 
     attempt = 0
     retry_delay = 2  # seconds between retries
+    # Resolve BEP34 targets once for the entire retry session to avoid DNS lookups
+    # on every attempt.
+    targets, _, bep34_err = _bep34_resolve_targets(tracker_url, bep34)
+    if bep34_err and not targets:
+        print(f"Error: {bep34_err}", file=sys.stderr)
+        return False, None
+    if bep34_err:
+        print(f"Warning: {bep34_err}", file=sys.stderr)
 
     while True:
         attempt += 1
@@ -1648,11 +1839,14 @@ def test_tracker_with_retry(tracker_url, info_hash_hex, event, output_format, sh
             print(f"\n{BLUE}[Attempt {attempt}]{NC}")
 
         # Try to connect
-        success, response_time = test_tracker(
-            tracker_url, info_hash_hex, event, output_format, show_peers,
-            user_agent, peer_id, num_want, scrape, lookup_dns, left, accept_encoding,
-            nocolor=nocolor
+        # Use resolved target list directly to avoid re-running BEP34 DNS on retries.
+        success, response_time, last_error = _attempt_tracker_targets(
+            targets, info_hash_hex, event, output_format, show_peers,
+            user_agent, peer_id, num_want, scrape, lookup_dns, left,
+            accept_encoding, nocolor
         )
+        if not success and _should_emit_attempt_error(last_error):
+            print(f"Error: {last_error}", file=sys.stderr)
 
         if success:
             print(f"\n{GREEN}✓ Connection successful after {attempt} attempt(s)!{NC}")
@@ -1799,6 +1993,12 @@ def main():
         type=int,
         help="Retry connection until successful. Specify COUNT for max attempts (e.g., --retry 5 or -R 5), or omit for infinite retries (e.g., --retry or -R). Only works in single-tracker mode."
     )
+    parser.add_argument(
+        '--bep34',
+        choices=['off', 'prefer', 'strict'],
+        default='prefer',
+        help="BEP34 DNS TXT handling: off=disabled, prefer=try TXT-advertised endpoints first, strict=only allow TXT-advertised endpoints."
+    )
 
     args = parser.parse_args()
 
@@ -1861,7 +2061,7 @@ def main():
             args.file, info_hash, args.event, args.format, args.show_peers,
             user_agent, peer_id, args.num_want, args.delay, args.random_qb,
             args.scrape, args.lookup, left, args.accept_encoding,
-            nocolor=args.nocolor
+            nocolor=args.nocolor, bep34=args.bep34
         )
     else:
         # Single tracker mode
@@ -1871,14 +2071,14 @@ def main():
             success, response_time = test_tracker_with_retry(
                 args.tracker, info_hash, args.event, args.format, args.show_peers,
                 user_agent, peer_id, args.num_want, args.scrape, args.lookup,
-                max_attempts, left, args.accept_encoding, nocolor=args.nocolor
+                max_attempts, left, args.accept_encoding, nocolor=args.nocolor, bep34=args.bep34
             )
         else:
             # Normal mode: single attempt
             success, response_time = test_tracker(
                 args.tracker, info_hash, args.event, args.format, args.show_peers,
                 user_agent, peer_id, args.num_want, args.scrape, args.lookup,
-                left, args.accept_encoding, nocolor=args.nocolor
+                left, args.accept_encoding, nocolor=args.nocolor, bep34=args.bep34
             )
         sys.exit(0 if success else 1)
 
