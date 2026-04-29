@@ -33,6 +33,9 @@ import struct
 import random
 import time
 import os
+import shutil
+import subprocess
+import re
 
 try:
     import dns.resolver  # type: ignore
@@ -234,6 +237,88 @@ def _bep34_parse_txt_record(record_text):
     return prefs
 
 
+def _bep34_extract_records_from_output(lines):
+    """
+    Normalize TXT records from dig/nslookup output into plain record strings.
+    """
+    records = []
+    for raw in lines:
+        line = (raw or "").strip()
+        if not line:
+            continue
+        # Join multi-string TXT renderings like:
+        # "BITTORRENT UDP:6969" " TCP:8443"
+        quoted_parts = re.findall(r'"([^"]*)"', line)
+        if quoted_parts:
+            line = "".join(quoted_parts)
+        # nslookup: tracker.example text = "BITTORRENT UDP:... TCP:..."
+        if "text =" in line:
+            value = line.split("text =", 1)[1].strip()
+            records.append(value)
+            continue
+        # Ignore obvious boilerplate lines from nslookup
+        lower = line.lower()
+        if lower.startswith("server:") or lower.startswith("address:") or lower.startswith("non-authoritative"):
+            continue
+        if lower.startswith("authoritative answers"):
+            continue
+        records.append(line)
+    return records
+
+
+def _bep34_lookup_via_dig(hostname):
+    if not shutil.which("dig"):
+        return False, [], "dig not installed"
+    try:
+        cp = subprocess.run(
+            ["dig", "+short", "TXT", hostname],
+            capture_output=True,
+            text=True,
+            timeout=3.0,
+            check=False,
+        )
+    except Exception as e:
+        return False, [], f"dig failed: {e}"
+    if cp.returncode != 0:
+        err = (cp.stderr or "").strip() or f"dig exit {cp.returncode}"
+        return False, [], f"dig failed: {err}"
+
+    for record_text in _bep34_extract_records_from_output(cp.stdout.splitlines()):
+        if record_text.startswith("BITTORRENT"):
+            return True, _bep34_parse_txt_record(record_text), None
+    return False, [], None
+
+
+def _bep34_lookup_via_nslookup(hostname):
+    if not shutil.which("nslookup"):
+        return False, [], "nslookup not installed"
+    try:
+        cp = subprocess.run(
+            ["nslookup", "-type=TXT", hostname],
+            capture_output=True,
+            text=True,
+            timeout=4.0,
+            check=False,
+        )
+    except Exception as e:
+        return False, [], f"nslookup failed: {e}"
+    # BusyBox nslookup can return non-zero even with useful output; parse regardless.
+    lines = []
+    if cp.stdout:
+        lines.extend(cp.stdout.splitlines())
+    if cp.stderr:
+        lines.extend(cp.stderr.splitlines())
+
+    for record_text in _bep34_extract_records_from_output(lines):
+        if record_text.startswith("BITTORRENT"):
+            return True, _bep34_parse_txt_record(record_text), None
+    # If command clearly failed and we found nothing, treat as an error.
+    if cp.returncode != 0:
+        err = (cp.stderr or "").strip() or f"nslookup exit {cp.returncode}"
+        return False, [], f"nslookup failed: {err}"
+    return False, [], None
+
+
 def _bep34_lookup_prefs(hostname):
     """
     Returns (has_bep34_record, prefs, error_message).
@@ -242,37 +327,54 @@ def _bep34_lookup_prefs(hostname):
     """
     if not hostname:
         return False, [], None
-    if dns is None:
-        return False, [], "dnspython not installed (pip install dnspython)"
-    try:
-        answer = dns.resolver.resolve(hostname, "TXT")
-    except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN):
-        # No TXT answer / host missing -> treat as no BEP34 record, not a warning-worthy failure.
-        return False, [], None
-    except DNSException as e:
-        return False, [], f"DNS TXT lookup failed: {e}"
+    # Primary: dnspython
+    if dns is not None:
+        try:
+            answer = dns.resolver.resolve(hostname, "TXT")
+        except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN):
+            # No TXT answer / host missing -> treat as no BEP34 record, not a warning-worthy failure.
+            return False, [], None
+        except DNSException:
+            # Fall through to shell-tool fallback before returning a hard error.
+            answer = None
+        except Exception:
+            answer = None
 
-    try:
-        for rdata in answer:
+        if answer is not None:
             try:
-                # dnspython may return split strings; join then decode to text.
-                # If one unrelated TXT record is malformed, skip it and keep searching.
-                parts = []
-                for p in getattr(rdata, "strings", []):
-                    if isinstance(p, bytes):
-                        parts.append(p.decode("utf-8", errors="ignore"))
-                    else:
-                        parts.append(str(p))
-                record_text = "".join(parts).strip()
+                for rdata in answer:
+                    try:
+                        # dnspython may return split strings; join then decode to text.
+                        # If one unrelated TXT record is malformed, skip it and keep searching.
+                        parts = []
+                        for p in getattr(rdata, "strings", []):
+                            if isinstance(p, bytes):
+                                parts.append(p.decode("utf-8", errors="ignore"))
+                            else:
+                                parts.append(str(p))
+                        record_text = "".join(parts).strip()
+                    except Exception:
+                        continue
+                    if record_text.startswith("BITTORRENT"):
+                        return True, _bep34_parse_txt_record(record_text), None
+                return False, [], None
             except Exception:
-                continue
-            if record_text.startswith("BITTORRENT"):
-                # Keep parse outside the decode/shape try-block so future parser changes
-                # do not silently turn a detected BEP34 record into "no record".
-                return True, _bep34_parse_txt_record(record_text), None
-    except Exception as e:
-        return False, [], f"DNS TXT iteration failed: {e}"
-    return False, [], None
+                # Fall through to shell-tool fallback.
+                pass
+
+    # Fallbacks: dig first, then nslookup
+    has_record, prefs, err = _bep34_lookup_via_dig(hostname)
+    if has_record:
+        return True, prefs, None
+    if err is None:
+        return False, [], None
+
+    has_record, prefs, err2 = _bep34_lookup_via_nslookup(hostname)
+    if has_record:
+        return True, prefs, None
+    if err2 is None:
+        return False, [], None
+    return False, [], f"{err}; {err2}"
 
 
 def _bep34_build_candidate_urls(tracker_url, prefs):
