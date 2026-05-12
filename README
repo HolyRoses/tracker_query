@@ -1,4 +1,5 @@
-usage: tracker_query.py [-h] [-b] [-t URL] [-H HEX] [-e EVENT] [-o FORMAT] [-f FILE] [-p] [-l] [-r] [-n NUM] [-L BYTES] [-d SECONDS] [--nocolor] [-a MODE] [-s] [--full-scrape] [-R [COUNT]] [--bep34 {off,prefer,strict}]
+usage: tracker_query.py [-h] [-b] [-t URL] [-H HEX] [-e EVENT] [-o FORMAT] [-f FILE] [-p] [-l] [-r] [-n NUM] [-L BYTES] [-d SECONDS] [--nocolor] [-a MODE] [-s] [--full-scrape] [-R [COUNT]] [--bep34 {off,prefer,strict}] [--loop] [--interval SECONDS] [--max-iterations N]
+                        [--cid-client-max-age-sec SECONDS] [--retry-on-timeout N] [--retry-on-error N] [--reconnect-on-tracker-error {on,off}] [--bitcomet-mode]
 
 Query a BitTorrent tracker announce endpoint and display swarm info (seeds, leechers, peers). Supports HTTP/HTTPS and UDP trackers, as well as scrape requests.
 
@@ -23,3 +24,13 @@ optional arguments:
   --full-scrape                 Scrape with no info_hash (implies --scrape). Tests if tracker allows full scrape. (default: False)
   -R [COUNT], --retry [COUNT]   Retry connection until successful. Specify COUNT for max attempts (e.g., --retry 5 or -R 5), or omit for infinite retries (e.g., --retry or -R). Only works in single-tracker mode. (default: None)
   --bep34 {off,prefer,strict}   BEP34 DNS TXT handling: off=disabled, prefer=try TXT-advertised endpoints first, strict=only allow TXT-advertised endpoints. (default: prefer)
+  --loop                        Run continuously (single-tracker mode only). For UDP trackers, reuses CID between requests. (default: False)
+  --interval SECONDS            Loop interval seconds when --loop is enabled. (default: 5.0)
+  --max-iterations N            Max loop cycles. 0 means infinite. (default: 0)
+  --cid-client-max-age-sec SECONDS
+                                Max client-side CID age before reconnect in UDP loop mode. 0 means never refresh proactively (BitComet-style). (default: 60)
+  --retry-on-timeout N          Retries per loop cycle on timeout in UDP loop mode. -1 means infinite. (default: -1)
+  --retry-on-error N            Retries per loop cycle on non-timeout errors in UDP loop mode. -1 means infinite. (default: -1)
+  --reconnect-on-tracker-error {on,off}
+                                On tracker error in UDP loop mode: on=reconnect and recover where possible, off=do not reconnect (BitComet-style). (default: on)
+  --bitcomet-mode               UDP loop convenience mode: sets --reconnect-on-tracker-error off, --cid-client-max-age-sec 0, and BitComet-like identity (peer_id -BC0220-...). (default: False)
