@@ -65,13 +65,18 @@ NOCOLOR = False
 
 DEFAULT_INFO_HASH_HEX = '5CB6C44712D494A87E8554839FB0541046B157AF'
 DEFAULT_TRACKER       = 'udp://tracker.opentrackr.org:6969/announce'
-DEFAULT_PEER_ID       = b'-qB5140-' + os.urandom(12)
-DEFAULT_USER_AGENT    = "qBittorrent/5.1.4"
+DEFAULT_PEER_ID       = b'-qB5200-' + os.urandom(12)
+DEFAULT_USER_AGENT    = "qBittorrent/5.2.0"
 DEFAULT_TIMEOUT       = 12
 DEFAULT_EVENT         = 'started'
 DEFAULT_NUM_WANT      = 50
 DEFAULT_LEFT          = 1_000_000_000
 DEFAULT_ACCEPT_ENCODING = 'all'
+DEFAULT_LOOP_INTERVAL = 5.0
+DEFAULT_CID_CLIENT_MAX_AGE_SEC = 60
+DEFAULT_LOOP_RETRY_ON_TIMEOUT = -1
+DEFAULT_LOOP_RETRY_ON_ERROR = -1
+DEFAULT_BITCOMET_USER_AGENT = "BitComet/2.20"
 
 
 def _nocolor_active(nocolor=None):
@@ -139,6 +144,7 @@ QB_VERSIONS = [
     ('5.1.2',   '5120'),
     ('5.1.3',   '5130'),
     ('5.1.4',   '5140'),
+    ('5.2.0',   '5200'),
 ]
 
 # UDP Protocol constants
@@ -156,6 +162,13 @@ def get_random_qb_client():
     version, code = random.choice(QB_VERSIONS)
     user_agent = f"qBittorrent/{version}"
     peer_id = f"-qB{code}-".encode('ascii') + os.urandom(12)
+    return user_agent, peer_id
+
+
+def get_bitcomet_client():
+    """Return a BitComet-like client identity (v2.20)."""
+    user_agent = DEFAULT_BITCOMET_USER_AGENT
+    peer_id = b'-BC0220-' + os.urandom(12)
     return user_agent, peer_id
 
 # ────────────────────────────────────────────────────
@@ -1453,6 +1466,286 @@ def udp_scrape(sock, addr, connection_id, transaction_id, info_hash_list):
 
     return stats
 
+
+def _is_udp_tracker_error(exc: Exception) -> bool:
+    text = str(exc or '')
+    return text.startswith('Tracker error:')
+
+
+def _loop_attempt_allowed(attempt_count: int, max_attempts: int) -> bool:
+    if max_attempts < 0:
+        return True
+    return attempt_count <= max_attempts
+
+
+def _run_udp_loop(
+    tracker_url,
+    info_hash_hex,
+    event,
+    scrape,
+    interval_sec,
+    max_iterations,
+    cid_client_max_age_sec,
+    retry_on_timeout,
+    retry_on_error,
+    reconnect_on_tracker_error,
+    user_agent,
+    peer_id,
+    num_want,
+    left
+):
+    """
+    Continuous UDP probe loop with CID reuse.
+
+    - Reuses CID until proactive max-age is reached (or indefinitely when 0).
+    - On CID rejection, reconnects and retries current cycle.
+    - Retries timeout/error paths according to retry limits; -1 means infinite.
+    """
+    try:
+        hostname, port = parse_udp_url(tracker_url)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 2
+
+    if scrape:
+        if info_hash_hex is None:
+            print("Error: Full scrape is not supported for UDP trackers. Provide --hash.", file=sys.stderr)
+            return 2
+        if isinstance(info_hash_hex, list):
+            hash_inputs = info_hash_hex
+        else:
+            hash_inputs = [info_hash_hex]
+        info_hash_list = []
+        for hash_hex in hash_inputs:
+            try:
+                info_hash_list.append(parse_info_hash(hash_hex, include_input=True))
+            except ValueError as e:
+                print(f"Error: Invalid info hash — {e}", file=sys.stderr)
+                return 2
+    else:
+        try:
+            info_hash_bytes = parse_info_hash(info_hash_hex)
+        except ValueError as e:
+            print(f"Error: Invalid info hash — {e}", file=sys.stderr)
+            return 2
+
+    print(f"\n{'─' * 50}")
+    print(f"UDP LOOP {'SCRAPE' if scrape else event.upper()} → {tracker_url}")
+    print(f"{'─' * 50}")
+    print(f"Client: {user_agent}")
+    print(
+        "Settings: "
+        f"interval={interval_sec}s "
+        f"max_iterations={'infinite' if max_iterations <= 0 else max_iterations} "
+        f"cid_client_max_age_sec={cid_client_max_age_sec} "
+        f"retry_on_timeout={retry_on_timeout} "
+        f"retry_on_error={retry_on_error} "
+        f"reconnect_on_tracker_error={reconnect_on_tracker_error}"
+    )
+    print("Press Ctrl+C to stop.")
+
+    cycle_count = 0
+    success_count = 0
+    fail_count = 0
+    reconnect_count = 0
+    cid_reuse_count = 0
+    response_times_ms = []
+
+    connection_id = None
+    cid_issued_at = 0.0
+
+    def _open_loop_socket():
+        try:
+            addr_info = socket.getaddrinfo(hostname, port, socket.AF_UNSPEC, socket.SOCK_DGRAM)
+            if not addr_info:
+                raise RuntimeError(f"No address found for {hostname}")
+            family, _, _, _, sockaddr = addr_info[0]
+            s = socket.socket(family, socket.SOCK_DGRAM)
+            s.settimeout(DEFAULT_TIMEOUT)
+            return s, sockaddr, family
+        except Exception as e:
+            raise RuntimeError(f"UDP loop socket setup failed: {e}")
+
+    try:
+        sock, addr, family = _open_loop_socket()
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+
+    print(f"Connecting to: {hostname}:{port}")
+    print(f"Resolved to: {addr[0]} ({'IPv6' if family == socket.AF_INET6 else 'IPv4'})")
+
+    try:
+        while True:
+            if max_iterations > 0 and cycle_count >= max_iterations:
+                break
+            cycle_count += 1
+
+            timeout_attempt = 0
+            error_attempt = 0
+
+            while True:
+                if connection_id is None:
+                    need_connect = True
+                elif cid_client_max_age_sec > 0 and (time.time() - cid_issued_at) >= float(cid_client_max_age_sec):
+                    need_connect = True
+                else:
+                    need_connect = False
+
+                cycle_start = time.time()
+                action = 'scrape' if scrape else 'announce'
+
+                try:
+                    if need_connect:
+                        had_cid = connection_id is not None
+                        txid = random.randint(0, 0xFFFFFFFF)
+                        connection_id = udp_connect(sock, addr, txid)
+                        cid_issued_at = time.time()
+                        if had_cid:
+                            reconnect_count += 1
+                    else:
+                        cid_reuse_count += 1
+
+                    txid = random.randint(0, 0xFFFFFFFF)
+                    if scrape:
+                        udp_scrape(sock, addr, connection_id, txid, info_hash_list)
+                    else:
+                        udp_announce(
+                            sock, addr, connection_id, txid, info_hash_bytes, event,
+                            peer_id, num_want, left
+                        )
+                    elapsed_ms = (time.time() - cycle_start) * 1000.0
+                    cid_age = int(max(0.0, time.time() - cid_issued_at)) if connection_id is not None else -1
+                    print(
+                        f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] "
+                        f"#{cycle_count} {action} ok "
+                        f"Response Time: {elapsed_ms:.2f} ms "
+                        f"cid_age_sec={cid_age}"
+                    )
+                    success_count += 1
+                    response_times_ms.append(float(elapsed_ms))
+                    break
+
+                except TimeoutError as e:
+                    fail_count += 1
+                    timeout_attempt += 1
+                    print(
+                        f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] "
+                        f"#{cycle_count} {action} timeout: {e} "
+                        f"(attempt={timeout_attempt})"
+                    )
+                    if not _loop_attempt_allowed(timeout_attempt, retry_on_timeout):
+                        return 1
+                    # Keep CID by default on timeout; next cycle/attempt reuses it.
+                    time.sleep(min(30.0, max(0.2, float(interval_sec))))
+                    continue
+
+                except ValueError as e:
+                    fail_count += 1
+                    # BitComet-style mode: ignore tracker error semantics and do
+                    # not reconnect automatically, regardless of error message.
+                    if not reconnect_on_tracker_error:
+                        error_attempt += 1
+                        print(
+                            f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] "
+                            f"#{cycle_count} {action} tracker_error -> NOT reconnecting "
+                            f"(BitComet-style, attempt={error_attempt}): {e}"
+                        )
+                        if not _loop_attempt_allowed(error_attempt, retry_on_error):
+                            return 1
+                        time.sleep(min(30.0, max(0.2, float(interval_sec))))
+                        continue
+
+                    # Generic tracker error packet: reconnect and retry this cycle.
+                    if _is_udp_tracker_error(e):
+                        print(
+                            f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] "
+                            f"#{cycle_count} {action} tracker_error -> reconnecting"
+                        )
+                        connection_id = None
+                        continue
+
+                    error_attempt += 1
+                    print(
+                        f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] "
+                        f"#{cycle_count} {action} error: {e} "
+                        f"(attempt={error_attempt})"
+                    )
+                    if not _loop_attempt_allowed(error_attempt, retry_on_error):
+                        return 1
+                    time.sleep(min(30.0, max(0.2, float(interval_sec))))
+                    continue
+
+                except Exception as e:
+                    fail_count += 1
+                    error_attempt += 1
+                    print(
+                        f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] "
+                        f"#{cycle_count} {action} exception: {type(e).__name__}: {e} "
+                        f"(attempt={error_attempt})"
+                    )
+                    if not _loop_attempt_allowed(error_attempt, retry_on_error):
+                        return 1
+                    # Socket-level errors can leave this socket unusable. Re-open and
+                    # force a reconnect+CId refresh while preserving loop continuity.
+                    if isinstance(e, OSError):
+                        try:
+                            sock.close()
+                        except Exception:
+                            pass
+                        # Socket is no longer trustworthy; force CID refresh on
+                        # next attempt even if reopen fails transiently.
+                        connection_id = None
+                        try:
+                            sock, addr, family = _open_loop_socket()
+                            print(
+                                f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] "
+                                f"#{cycle_count} socket_reopen ok "
+                                f"resolved={addr[0]} family={'IPv6' if family == socket.AF_INET6 else 'IPv4'}"
+                            )
+                        except Exception as open_err:
+                            print(
+                                f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] "
+                                f"#{cycle_count} socket_reopen failed: {open_err}"
+                            )
+                    time.sleep(min(30.0, max(0.2, float(interval_sec))))
+                    continue
+
+            # Completed this cycle successfully.
+            if interval_sec > 0:
+                time.sleep(interval_sec)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+    print(f"\n{'─' * 50}")
+    print("UDP LOOP SUMMARY")
+    print(f"{'─' * 50}")
+    print(f"cycles:          {cycle_count}")
+    print(f"successful:      {success_count}")
+    print(f"failed-attempts: {fail_count}")
+    print(f"reconnects:      {reconnect_count}")
+    print(f"cid_reuse_hits:  {cid_reuse_count}")
+    if response_times_ms:
+        sorted_times = sorted(response_times_ms)
+        n = len(sorted_times)
+        avg_ms = sum(sorted_times) / float(n)
+        p50_ms = sorted_times[int((n - 1) * 0.50)]
+        p95_ms = sorted_times[int((n - 1) * 0.95)]
+        min_ms = sorted_times[0]
+        max_ms = sorted_times[-1]
+        print(f"resp_ms avg:     {avg_ms:.2f}")
+        print(f"resp_ms min:     {min_ms:.2f}")
+        print(f"resp_ms p50:     {p50_ms:.2f}")
+        print(f"resp_ms p95:     {p95_ms:.2f}")
+        print(f"resp_ms max:     {max_ms:.2f}")
+    print(f"{'─' * 50}")
+    return 0
+
 def test_udp_scrape(tracker_url, info_hash_hex, output_format, user_agent, nocolor=None):
     """Test UDP tracker scrape endpoint and return response time in milliseconds."""
     start_time = time.time()
@@ -2101,6 +2394,58 @@ def main():
         default='prefer',
         help="BEP34 DNS TXT handling: off=disabled, prefer=try TXT-advertised endpoints first, strict=only allow TXT-advertised endpoints."
     )
+    parser.add_argument(
+        '--loop',
+        action='store_true',
+        help="Run continuously (single-tracker mode only). For UDP trackers, reuses CID between requests."
+    )
+    parser.add_argument(
+        '--interval',
+        metavar='SECONDS',
+        type=float,
+        default=DEFAULT_LOOP_INTERVAL,
+        help="Loop interval seconds when --loop is enabled."
+    )
+    parser.add_argument(
+        '--max-iterations',
+        metavar='N',
+        type=int,
+        default=0,
+        help="Max loop cycles. 0 means infinite."
+    )
+    parser.add_argument(
+        '--cid-client-max-age-sec',
+        metavar='SECONDS',
+        type=int,
+        default=DEFAULT_CID_CLIENT_MAX_AGE_SEC,
+        help="Max client-side CID age before reconnect in UDP loop mode. 0 means never refresh proactively (BitComet-style)."
+    )
+    parser.add_argument(
+        '--retry-on-timeout',
+        metavar='N',
+        type=int,
+        default=DEFAULT_LOOP_RETRY_ON_TIMEOUT,
+        help="Retries per loop cycle on timeout in UDP loop mode. -1 means infinite."
+    )
+    parser.add_argument(
+        '--retry-on-error',
+        metavar='N',
+        type=int,
+        default=DEFAULT_LOOP_RETRY_ON_ERROR,
+        help="Retries per loop cycle on non-timeout errors in UDP loop mode. -1 means infinite."
+    )
+    parser.add_argument(
+        '--reconnect-on-tracker-error',
+        choices=['on', 'off'],
+        default='on',
+        help="On tracker error in UDP loop mode: on=reconnect and recover where possible, off=do not reconnect (BitComet-style)."
+    )
+    parser.add_argument(
+        '--bitcomet-mode',
+        action='store_true',
+        help="UDP loop convenience mode: sets --reconnect-on-tracker-error off, "
+             "--cid-client-max-age-sec 0, and BitComet-like identity (peer_id -BC0220-...)."
+    )
 
     args = parser.parse_args()
 
@@ -2118,6 +2463,19 @@ def main():
     if args.retry is not None and args.batch:
         print("Error: --retry only works in single-tracker mode, not in batch mode", file=sys.stderr)
         sys.exit(2)
+    if args.loop and args.batch:
+        print("Error: --loop only works in single-tracker mode, not in batch mode", file=sys.stderr)
+        sys.exit(2)
+    if args.loop and args.retry is not None:
+        print("Error: --loop and --retry cannot be used together", file=sys.stderr)
+        sys.exit(2)
+    if args.bitcomet_mode and not args.loop:
+        print("Error: --bitcomet-mode requires --loop", file=sys.stderr)
+        sys.exit(2)
+
+    if args.bitcomet_mode:
+        args.reconnect_on_tracker_error = 'off'
+        args.cid_client_max_age_sec = 0
 
     # Validate --lookup requires --show-peers
     if args.lookup and not args.show_peers:
@@ -2151,7 +2509,9 @@ def main():
         left = DEFAULT_LEFT
 
     # Determine client info
-    if args.random_qb:
+    if args.bitcomet_mode:
+        user_agent, peer_id = get_bitcomet_client()
+    elif args.random_qb:
         user_agent, peer_id = get_random_qb_client()
     else:
         user_agent = DEFAULT_USER_AGENT
@@ -2167,7 +2527,35 @@ def main():
         )
     else:
         # Single tracker mode
-        if args.retry is not None:
+        if args.loop:
+            targets, _, bep34_err = _bep34_resolve_targets(args.tracker, args.bep34)
+            if bep34_err and not targets:
+                print(f"Error: {bep34_err}", file=sys.stderr)
+                sys.exit(2)
+            if bep34_err:
+                print(f"Warning: {bep34_err}", file=sys.stderr)
+            udp_targets = [t for t in targets if urllib.parse.urlparse(t).scheme.lower() == 'udp']
+            if not udp_targets:
+                print("Error: --loop is currently supported for UDP trackers only", file=sys.stderr)
+                sys.exit(2)
+            rc = _run_udp_loop(
+                udp_targets[0],
+                info_hash,
+                args.event,
+                args.scrape,
+                max(0.0, float(args.interval)),
+                int(args.max_iterations),
+                int(args.cid_client_max_age_sec),
+                int(args.retry_on_timeout),
+                int(args.retry_on_error),
+                str(args.reconnect_on_tracker_error).lower() != 'off',
+                user_agent,
+                peer_id,
+                args.num_want,
+                left
+            )
+            sys.exit(rc)
+        elif args.retry is not None:
             # Retry mode: retry until success or max attempts
             max_attempts = args.retry if args.retry > 0 else 0  # 0 means infinite
             success, response_time = test_tracker_with_retry(
