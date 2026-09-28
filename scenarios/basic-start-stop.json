@@ -1,0 +1,37 @@
+{
+  "version": 1,
+  "name": "basic-start-stop",
+  "defaults": {
+    "info_hash": "1111111111111111111111111111111111111111",
+    "peer_id_ascii": "-qB5210-SCENARIO0002",
+    "port": 51413,
+    "key": 270544960,
+    "num_want": 0,
+    "uploaded": 0,
+    "downloaded": 0,
+    "left": 1000000000
+  },
+  "steps": [
+    {
+      "name": "start leecher session",
+      "action": "announce",
+      "event": "started",
+      "expect": {"success": true}
+    },
+    {
+      "name": "client remains idle",
+      "action": "sleep",
+      "duration_sec": 30
+    },
+    {
+      "name": "stop leecher session",
+      "action": "announce",
+      "event": "stopped",
+      "expect": {"success": true}
+    },
+    {
+      "name": "capture final state",
+      "action": "checkpoint"
+    }
+  ]
+}

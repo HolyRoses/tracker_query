@@ -1,0 +1,37 @@
+{
+  "version": 1,
+  "name": "download-to-completion",
+  "defaults": {
+    "info_hash": "2222222222222222222222222222222222222222",
+    "peer_id_ascii": "-qB5210-SCENARIO0003",
+    "port": 51413,
+    "key": 270544961,
+    "num_want": 25,
+    "uploaded": 0,
+    "downloaded": 0,
+    "left": 100000000
+  },
+  "steps": [
+    {
+      "name": "start download",
+      "action": "announce",
+      "event": "started",
+      "expect": {"success": true}
+    },
+    {
+      "name": "download 100 MB payload",
+      "action": "transfer",
+      "duration_sec": 10,
+      "report_interval_sec": 5,
+      "download_rate_mbps": 80,
+      "upload_rate_mbps": 8,
+      "stop_at_end": true,
+      "expect": {"success": true},
+      "stop_expect": {"success": true}
+    },
+    {
+      "name": "capture completed counters",
+      "action": "checkpoint"
+    }
+  ]
+}

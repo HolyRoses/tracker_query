@@ -1,0 +1,59 @@
+{
+  "version": 1,
+  "name": "download-complete-restart-seed-200mbit",
+  "defaults": {
+    "info_hash": "0123456789abcdef0123456789abcdef01234567",
+    "peer_id_ascii": "-qB5210-SCENARIO0001",
+    "port": 51413,
+    "key": 305419896,
+    "num_want": 0,
+    "uploaded": 0,
+    "downloaded": 0,
+    "left": 10737418240
+  },
+  "steps": [
+    {
+      "name": "start download",
+      "action": "announce",
+      "event": "started",
+      "expect": {"success": true}
+    },
+    {
+      "name": "download at 200 Mbit and upload at 20 Mbit",
+      "action": "transfer",
+      "duration_sec": 480,
+      "report_interval_sec": 60,
+      "download_rate_mbps": 200,
+      "upload_rate_mbps": 20,
+      "stop_at_end": true,
+      "expect": {"success": true},
+      "stop_expect": {"success": true}
+    },
+    {
+      "name": "client remains closed for 30 minutes",
+      "action": "sleep",
+      "duration_sec": 1800
+    },
+    {
+      "name": "restart as seeder",
+      "action": "announce",
+      "event": "started",
+      "expect": {"success": true}
+    },
+    {
+      "name": "seed for two hours at 200 Mbit",
+      "action": "transfer",
+      "duration_sec": 7200,
+      "report_interval_sec": 60,
+      "download_rate_mbps": 0,
+      "upload_rate_mbps": 200,
+      "stop_at_end": true,
+      "expect": {"success": true},
+      "stop_expect": {"success": true}
+    },
+    {
+      "name": "final counters",
+      "action": "checkpoint"
+    }
+  ]
+}

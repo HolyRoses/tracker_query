@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.ruff_cache/
+/evidence*.json
+/announce-token*.txt
+
+# Editors and operating systems
+.DS_Store
+.idea/
+.vscode/
+*.swp

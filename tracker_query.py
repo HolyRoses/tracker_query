@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Tracker announce tester
+BitTorrent tracker query and lifecycle test client.
 
 Queries a BitTorrent tracker announce endpoint and shows
 seeds / leechers / peer counts from the bencoded response.
@@ -8,22 +8,23 @@ seeds / leechers / peer counts from the bencoded response.
 Supports both HTTP/HTTPS and UDP trackers, as well as scrape requests.
 
 Examples:
-  ./tracker_test.py --tracker http://open.acgtracker.com:1096/announce
-  ./tracker_test.py -t udp://tracker.opentrackr.org:1337/announce
-  ./tracker_test.py -t http://tracker.example.net/announce --event completed
-  ./tracker_test.py --tracker udp://tracker2.com:6969 --hash deadbeef... --event started
-  ./tracker_test.py -t http://tracker.example.net/announce --format json --show-peers
-  ./tracker_test.py -t http://tracker.example.net/announce --show-peers --lookup
-  ./tracker_test.py -t http://tracker.example.net/announce --scrape
-  ./tracker_test.py -t http://tracker.example.net/announce --scrape --hash deadbeef...
-  ./tracker_test.py -t udp://flaky.tracker.com:1337/announce --retry
-  ./tracker_test.py -t http://tracker.example.net/announce -R 5
+  ./tracker_query.py --tracker https://tracker.example/announce
+  ./tracker_query.py -t udp://tracker.example:6969/announce
+  ./tracker_query.py -t https://tracker.example/announce --event completed
+  ./tracker_query.py -t udp://tracker.example:6969/announce --hash deadbeef... --event started
+  ./tracker_query.py -t https://tracker.example/announce --format json --show-peers
+  ./tracker_query.py -t https://tracker.example/announce --show-peers --lookup
+  ./tracker_query.py -t https://tracker.example/announce --scrape
+  ./tracker_query.py -t https://tracker.example/announce --scrape --hash deadbeef...
+  ./tracker_query.py -t udp://tracker.example:6969/announce --retry
+  ./tracker_query.py -t https://tracker.example/announce -R 5
 """
 
 import sys
 import argparse
 import gzip
 import zlib
+import ssl
 import io
 import urllib.parse
 import urllib.request
@@ -36,6 +37,10 @@ import os
 import shutil
 import subprocess
 import re
+import stat
+import tempfile
+from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation, ROUND_FLOOR
 
 try:
     import dns.resolver  # type: ignore
@@ -63,13 +68,22 @@ except Exception:
 # Global flag for color output (set by command-line argument)
 NOCOLOR = False
 
-DEFAULT_INFO_HASH_HEX = '5CB6C44712D494A87E8554839FB0541046B157AF'
+DEFAULT_INFO_HASH_HEX = '0123456789ABCDEF0123456789ABCDEF01234567'
 DEFAULT_TRACKER       = 'udp://tracker.opentrackr.org:6969/announce'
-DEFAULT_PEER_ID       = b'-qB5200-' + os.urandom(12)
-DEFAULT_USER_AGENT    = "qBittorrent/5.2.0"
+QB_PEER_ID_SUFFIX_CHARS = b'0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz.-_~!*()'
+
+
+def make_qb_peer_id(code: str = '5210') -> bytes:
+    """Return a qBittorrent-like printable 20-byte peer_id."""
+    suffix = bytes(random.choice(QB_PEER_ID_SUFFIX_CHARS) for _ in range(12))
+    return f'-qB{code}-'.encode('ascii') + suffix
+
+
+DEFAULT_PEER_ID       = make_qb_peer_id('5210')
+DEFAULT_USER_AGENT    = "qBittorrent/5.2.1"
 DEFAULT_TIMEOUT       = 12
 DEFAULT_EVENT         = 'started'
-DEFAULT_NUM_WANT      = 50
+DEFAULT_NUM_WANT      = 200
 DEFAULT_LEFT          = 1_000_000_000
 DEFAULT_ACCEPT_ENCODING = 'all'
 DEFAULT_LOOP_INTERVAL = 5.0
@@ -77,6 +91,10 @@ DEFAULT_CID_CLIENT_MAX_AGE_SEC = 60
 DEFAULT_LOOP_RETRY_ON_TIMEOUT = -1
 DEFAULT_LOOP_RETRY_ON_ERROR = -1
 DEFAULT_BITCOMET_USER_AGENT = "BitComet/2.20"
+MAX_WIRE_COUNTER = (1 << 64) - 1
+MAX_ANNOUNCE_TOKEN_BYTES = 512
+MAX_SCENARIO_STEPS = 10_000
+MAX_SCENARIO_DURATION_SEC = 7 * 24 * 60 * 60
 
 
 def _nocolor_active(nocolor=None):
@@ -112,6 +130,13 @@ def _response_time_color_and_label(response_time, colors):
         return colors['YELLOW'], "OK"
     return colors['RED'], "Slow"
 
+def _ssl_context_for_url(url, insecure=False):
+    """Return an unverified SSL context for curl -k style HTTPS probes."""
+    if insecure and urllib.parse.urlparse(url).scheme.lower() == 'https':
+        return ssl._create_unverified_context()
+    return None
+
+
 # qBittorrent version data for --random-qb
 QB_VERSIONS = [
     ('4.1.9.1', '4191'),
@@ -145,6 +170,7 @@ QB_VERSIONS = [
     ('5.1.3',   '5130'),
     ('5.1.4',   '5140'),
     ('5.2.0',   '5200'),
+    ('5.2.1',   '5210'),
 ]
 
 # UDP Protocol constants
@@ -158,10 +184,10 @@ UDP_PROTOCOL_ID     = 0x41727101980  # Magic constant for UDP trackers
 # ────────────────────────────────────────────────────
 
 def get_random_qb_client():
-    """Select a random qBittorrent version and return (user_agent, peer_id)"""
+    """Select a random qBittorrent version and return (user_agent, peer_id)."""
     version, code = random.choice(QB_VERSIONS)
     user_agent = f"qBittorrent/{version}"
-    peer_id = f"-qB{code}-".encode('ascii') + os.urandom(12)
+    peer_id = make_qb_peer_id(code)
     return user_agent, peer_id
 
 
@@ -461,7 +487,7 @@ def _should_emit_attempt_error(last_error):
 def _attempt_tracker_targets(
     targets, info_hash_hex, event, output_format, show_peers,
     user_agent, peer_id, num_want, scrape=False, lookup_dns=False,
-    left=DEFAULT_LEFT, accept_encoding=DEFAULT_ACCEPT_ENCODING, nocolor=None
+    left=DEFAULT_LEFT, accept_encoding=DEFAULT_ACCEPT_ENCODING, nocolor=None, insecure=False
 ):
     """
     Try tracker targets in order and return (success, response_time, last_error).
@@ -472,7 +498,7 @@ def _attempt_tracker_targets(
         try:
             response_time = _test_tracker_impl(
                 target, info_hash_hex, event, output_format, show_peers,
-                user_agent, peer_id, num_want, scrape, lookup_dns, left, accept_encoding, nocolor
+                user_agent, peer_id, num_want, scrape, lookup_dns, left, accept_encoding, nocolor, insecure
             )
             return True, response_time, None
         except SystemExit as e:
@@ -627,8 +653,6 @@ def apply_dns_lookup_to_peers(peer_list):
 def format_table_output(data, show_peers=False, lookup_dns=False, nocolor=None):
     """Format data as a clean aligned table"""
     colors = _color_palette(nocolor)
-    BRIGHT_GREEN = colors['BRIGHT_GREEN']
-    GREEN = colors['GREEN']
     YELLOW = colors['YELLOW']
     RED = colors['RED']
     NC = colors['NC']
@@ -646,24 +670,19 @@ def format_table_output(data, show_peers=False, lookup_dns=False, nocolor=None):
     if data.get('response_encoding'):
         print(f"Response Encoding: {data['response_encoding']:>10}")
 
-    # Display warning message if present
-    # example Warning using http://nyaa.tracker.wf:7777/announce
+    # Display warning message if present.
     if data.get('warning_message'):
         print(f"{YELLOW}⚠ Warning:         {data['warning_message']}{NC}")
 
-    # Display failure reason if present
-    # example Failure using http://ch3oh.ru:6969/announce
+    # Display failure reason if present.
     if data.get('failure_reason'):
         print(f"{RED}✗ Failure:         {data['failure_reason']}{NC}")
 
-    # Display external IP if present (BEP 24)
-    # IPv4 reply from http://tracker.skyts.net:6969/announce
-    # IPv6 reply from http://tracker.ghostchu-services.top:80/announce
+    # Display external IP if present (BEP 24).
     if data.get('external_ip'):
         print(f"External IP:       {data['external_ip']}")
 
-    # Display tracker ID if present
-    # Currently supported @ http://tracker.skyts.net:6969/announce
+    # Display tracker ID if present.
     if data.get('tracker_id'):
         print(f"Tracker ID:        {data['tracker_id']}")
 
@@ -738,9 +757,6 @@ def format_scrape_csv_output(torrents):
 def format_scrape_table_output(data, nocolor=None):
     """Format scrape data as a clean aligned table"""
     colors = _color_palette(nocolor)
-    BRIGHT_GREEN = colors['BRIGHT_GREEN']
-    GREEN = colors['GREEN']
-    YELLOW = colors['YELLOW']
     RED = colors['RED']
     NC = colors['NC']
 
@@ -761,8 +777,7 @@ def format_scrape_table_output(data, nocolor=None):
     if data.get('failure_reason'):
         print(f"{RED}✗ Failure:         {data['failure_reason']}{NC}")
 
-    # Display min_request_interval if present (unofficial extension)
-    # Example return data from http://1337.abcvg.info:80/announce or http://ftp.pet:6969/announce
+    # Display min_request_interval if present (unofficial extension).
     if data.get('min_request_interval'):
         print(f"Min Request Int:   {data['min_request_interval']:>10} s")
 
@@ -787,12 +802,103 @@ def format_scrape_table_output(data, nocolor=None):
 # HTTP Tracker Functions
 # ────────────────────────────────────────────────
 
+QB_QUERY_SAFE_BYTES = b'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~!*()'
+
+
 def percent_encode_bytes(data: bytes) -> str:
+    """qBittorrent/libtorrent-like query encoding for binary fields.
+
+    qB leaves common printable safe characters unescaped and uses lowercase
+    percent escapes for the rest, e.g. raw byte 0xe9 becomes %e9 while
+    ASCII letters/digits remain literal in nginx access logs.
     """
-    Strict BitTorrent-safe percent encoding.
-    Encodes EVERY byte as %XX (uppercase).
-    """
-    return ''.join(f'%{b:02X}' for b in data)
+    out = []
+    for b in data:
+        if b in QB_QUERY_SAFE_BYTES:
+            out.append(chr(b))
+        else:
+            out.append(f'%{b:02x}')
+    return ''.join(out)
+
+
+def quote_query_value(value) -> str:
+    if isinstance(value, bytes):
+        return percent_encode_bytes(value)
+    return percent_encode_bytes(str(value).encode('utf-8'))
+
+
+def append_raw_query(tracker_url, raw_query):
+    """Append an already encoded query fragment without losing existing keys."""
+    parsed = urllib.parse.urlsplit(tracker_url)
+    if parsed.fragment:
+        raise ValueError("Tracker URLs must not contain a fragment")
+    query = parsed.query
+    if raw_query:
+        query = f"{query}&{raw_query}" if query else raw_query
+    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path, query, ''))
+
+
+def redact_tracker_url(tracker_url):
+    """Redact credential query values while retaining useful endpoint context."""
+    try:
+        parsed = urllib.parse.urlsplit(tracker_url)
+    except Exception:
+        return '<invalid tracker URL>'
+    query = re.sub(
+        r'(?i)(^|&)(token=)[^&]*',
+        lambda match: f"{match.group(1)}{match.group(2)}<redacted>",
+        parsed.query,
+    )
+    return urllib.parse.urlunsplit(
+        (parsed.scheme, parsed.netloc, parsed.path, query, parsed.fragment)
+    )
+
+
+def add_announce_token(tracker_url, token):
+    parsed = urllib.parse.urlsplit(tracker_url)
+    existing_keys = [
+        key.lower()
+        for key, _ in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+    ]
+    if 'token' in existing_keys:
+        raise ValueError("Tracker URL already contains a token query parameter")
+    return append_raw_query(tracker_url, f"token={quote_query_value(token)}")
+
+
+def read_announce_token(path=None, from_stdin=False, allow_insecure_file=False):
+    if bool(path) == bool(from_stdin):
+        raise ValueError("Select exactly one announce-token input source")
+    if path:
+        flags = os.O_RDONLY | getattr(os, 'O_CLOEXEC', 0) | getattr(os, 'O_NOFOLLOW', 0)
+        descriptor = os.open(path, flags)
+        try:
+            file_stat = os.fstat(descriptor)
+            if not stat.S_ISREG(file_stat.st_mode):
+                raise ValueError("Announce token path must be a regular file")
+            if not allow_insecure_file and file_stat.st_mode & (stat.S_IRWXG | stat.S_IRWXO):
+                raise ValueError("Announce token file must not be accessible by group or others")
+            with os.fdopen(descriptor, 'rb') as handle:
+                descriptor = -1
+                raw = handle.read(MAX_ANNOUNCE_TOKEN_BYTES + 3)
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+    else:
+        raw = sys.stdin.buffer.read(MAX_ANNOUNCE_TOKEN_BYTES + 3)
+    if raw.endswith(b'\n'):
+        raw = raw[:-1]
+        if raw.endswith(b'\r'):
+            raw = raw[:-1]
+    if not raw:
+        raise ValueError("Announce token is empty")
+    if len(raw) > MAX_ANNOUNCE_TOKEN_BYTES:
+        raise ValueError(f"Announce token exceeds {MAX_ANNOUNCE_TOKEN_BYTES} bytes")
+    if b'\x00' in raw:
+        raise ValueError("Announce token contains a NUL byte")
+    try:
+        return raw.decode('utf-8')
+    except UnicodeDecodeError as exc:
+        raise ValueError("Announce token must be UTF-8 text") from exc
 
 
 def parse_info_hash(hex_str, include_input=False):
@@ -804,30 +910,62 @@ def parse_info_hash(hex_str, include_input=False):
         raise ValueError("Info hash must be exactly 40 hex characters (20 bytes)")
     return info_hash_bytes
 
-def build_announce_url(tracker_url, info_hash_bytes, event, peer_id, num_want, left=DEFAULT_LEFT):
-    params = {
-        'peer_id':     peer_id,
-        'port':        '6881',
-        'uploaded':    '0',
-        'downloaded':  '0',
-        'left':        str(left),
-        'compact':     '1',
-        'no_peer_id':  '1',
-        'numwant':     str(num_want),
-    }
+def build_announce_url(
+    tracker_url,
+    info_hash_bytes,
+    event,
+    peer_id,
+    num_want,
+    left=DEFAULT_LEFT,
+    downloaded=0,
+    uploaded=0,
+    announce_port=6881,
+    tracker_key=None,
+    corrupt=None,
+    supportcrypto=None,
+    redundant=None,
+    tracker_id=None,
+):
+    # qBittorrent/libtorrent emits a very stable query parameter order.
+    # Keep this sequence so nginx logs from tracker_query resemble real qB.
+    params = [
+        ('peer_id', peer_id),
+        ('port', str(announce_port)),
+        ('uploaded', str(max(0, int(uploaded)))),
+        ('downloaded', str(max(0, int(downloaded)))),
+        ('left', str(left)),
+    ]
+    if corrupt is not None:
+        params.append(('corrupt', str(corrupt)))
+    if tracker_key is not None:
+        params.append(('key', str(tracker_key)))
 
-    # Only include event when it's one of the explicit ones
+    # Only include event when it's one of the explicit ones.
     if event in ('started', 'completed', 'stopped'):
-        params['event'] = event
-    # else: omit entirely → means "none" / regular announce
+        params.append(('event', event))
 
-    # Encode everything except info_hash normally
-    query = urllib.parse.urlencode(params, doseq=False, safe='~')
+    params.extend([
+        ('numwant', str(num_want)),
+        ('compact', '1'),
+        ('no_peer_id', '1'),
+    ])
+    if supportcrypto is not None:
+        params.append(('supportcrypto', str(supportcrypto)))
+    if redundant is not None:
+        params.append(('redundant', str(redundant)))
+    if tracker_id:
+        params.append(('trackerid', str(tracker_id)))
 
-    # Strictly encode info_hash
+    query = '&'.join(
+        f"{key}={quote_query_value(value)}"
+        for key, value in params
+    )
     info_hash_encoded = percent_encode_bytes(info_hash_bytes)
 
-    return f"{tracker_url}?info_hash={info_hash_encoded}&{query}"
+    return append_raw_query(
+        tracker_url,
+        f"info_hash={info_hash_encoded}&{query}",
+    )
 
 
 def build_accept_encoding_header(mode):
@@ -923,7 +1061,7 @@ def normalize_response_encoding(content_encoding):
         return 'identity'
     return enc.split(',', 1)[0].strip() or 'identity'
 
-def test_http_tracker(tracker_url, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want, lookup_dns=False, left=DEFAULT_LEFT, accept_encoding=DEFAULT_ACCEPT_ENCODING, nocolor=None):
+def test_http_tracker(tracker_url, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want, lookup_dns=False, left=DEFAULT_LEFT, accept_encoding=DEFAULT_ACCEPT_ENCODING, nocolor=None, insecure=False):
     """Test HTTP/HTTPS tracker and return response time in milliseconds"""
     start_time = time.time()
 
@@ -938,10 +1076,11 @@ def test_http_tracker(tracker_url, info_hash_hex, event, output_format, show_pee
     # Only print headers for table format (not for json/csv)
     if output_format == 'table':
         print(f"\n{'─' * 50}")
-        print(f"HTTP {event.upper()} → {tracker_url}")
+        print(f"HTTP {event.upper()} → {redact_tracker_url(tracker_url)}")
         print(f"{'─' * 50}")
         print(f"Client: {user_agent}")
-        print(f"URL: {url[:140]}{'...' if len(url) > 140 else ''}")
+        safe_url = redact_tracker_url(url)
+        print(f"URL: {safe_url[:140]}{'...' if len(safe_url) > 140 else ''}")
 
     req = urllib.request.Request(
         url,
@@ -953,7 +1092,7 @@ def test_http_tracker(tracker_url, info_hash_hex, event, output_format, show_pee
     )
 
     try:
-        with urllib.request.urlopen(req, timeout=DEFAULT_TIMEOUT) as resp:
+        with urllib.request.urlopen(req, timeout=DEFAULT_TIMEOUT, context=_ssl_context_for_url(url, insecure)) as resp:
             response_time_ms = (time.time() - start_time) * 1000
             status = resp.getcode()
             body = resp.read()
@@ -1066,7 +1205,7 @@ def test_http_tracker(tracker_url, info_hash_hex, event, output_format, show_pee
                     apply_dns_lookup_to_peers(peer_list)
 
                 data = {
-                    'tracker': tracker_url,
+                    'tracker': redact_tracker_url(tracker_url),
                     'interval': interval,
                     'min_interval': min_int,
                     'seeds': seeds,
@@ -1117,7 +1256,328 @@ def test_http_tracker(tracker_url, info_hash_hex, event, output_format, show_pee
     # Return response time for batch mode tracking
     return round(response_time_ms, 2)
 
-def test_http_scrape(tracker_url, info_hash_hex, output_format, user_agent, accept_encoding=DEFAULT_ACCEPT_ENCODING, nocolor=None):
+def _http_request_bencoded(url, user_agent, accept_encoding, insecure=False):
+    start_time = time.time()
+    req = urllib.request.Request(
+        url,
+        headers={
+            'User-Agent': user_agent,
+            'Accept-Encoding': accept_encoding,
+        },
+        method='GET'
+    )
+    with urllib.request.urlopen(req, timeout=DEFAULT_TIMEOUT, context=_ssl_context_for_url(url, insecure)) as resp:
+        response_time_ms = (time.time() - start_time) * 1000.0
+        status = int(resp.getcode() or 0)
+        body = resp.read()
+        content_encoding = resp.getheader('Content-Encoding', '')
+        body = decode_http_body_for_content_encoding(body, content_encoding)
+        decoded = bdecode(body)
+        if not isinstance(decoded, dict):
+            raise ValueError('response is not a bencoded dictionary')
+        return status, body, decoded, response_time_ms, normalize_response_encoding(content_encoding)
+
+
+def _decode_bencoded_text(value):
+    if isinstance(value, bytes):
+        return value.decode('utf-8', errors='replace')
+    if value is None:
+        return ''
+    return str(value)
+
+
+def _build_http_scrape_url_for_loop(tracker_url, info_hash_hex):
+    scrape_url, error = convert_announce_to_scrape(tracker_url)
+    if error:
+        raise ValueError(error)
+    if info_hash_hex is None:
+        return scrape_url
+    hash_inputs = info_hash_hex if isinstance(info_hash_hex, list) else [info_hash_hex]
+    params = []
+    for hash_hex in hash_inputs:
+        params.append('info_hash=' + percent_encode_bytes(parse_info_hash(hash_hex, include_input=True)))
+    separator = '&' if '?' in scrape_url else '?'
+    return scrape_url + separator + '&'.join(params)
+
+
+def _http_loop_probe_once(tracker_url, info_hash_hex, event, scrape, user_agent, peer_id,
+                          num_want, left, downloaded, accept_encoding, insecure=False,
+                          tracker_key=None, tracker_id=None, uploaded=0,
+                          announce_port=6881):
+    if scrape:
+        url = _build_http_scrape_url_for_loop(tracker_url, info_hash_hex)
+    else:
+        info_hash_bytes = parse_info_hash(info_hash_hex)
+        url = build_announce_url(
+            tracker_url,
+            info_hash_bytes,
+            event,
+            peer_id,
+            num_want,
+            left,
+            downloaded,
+            uploaded,
+            announce_port,
+            tracker_key=tracker_key,
+            corrupt=0,
+            supportcrypto=1,
+            redundant=0,
+            tracker_id=tracker_id,
+        )
+
+    status, body, decoded, response_time_ms, response_encoding = _http_request_bencoded(
+        url, user_agent, accept_encoding, insecure
+    )
+    failure_reason = _decode_bencoded_text(decoded.get(b'failure reason', b'')).strip() or None
+    warning_message = _decode_bencoded_text(decoded.get(b'warning message', b'')).strip() or None
+    if failure_reason:
+        raise ValueError(f'Tracker failure: {failure_reason}')
+    response_tracker_id = _decode_bencoded_text(decoded.get(b'tracker id', b'')).strip() or None
+
+    if scrape:
+        files = decoded.get(b'files', {})
+        torrent_count = len(files) if isinstance(files, dict) else 0
+        complete = 0
+        incomplete = 0
+        downloaded = 0
+        if isinstance(files, dict):
+            for stats in files.values():
+                if isinstance(stats, dict):
+                    complete += int(stats.get(b'complete', 0) or 0)
+                    incomplete += int(stats.get(b'incomplete', 0) or 0)
+                    downloaded += int(stats.get(b'downloaded', 0) or 0)
+        return {
+            'status': status,
+            'response_time_ms': response_time_ms,
+            'response_encoding': response_encoding,
+            'warning_message': warning_message,
+            'tracker_id': response_tracker_id,
+            'torrent_count': torrent_count,
+            'complete': complete,
+            'incomplete': incomplete,
+            'downloaded': downloaded,
+            'body_bytes': len(body),
+        }
+
+    peers_ipv4 = decoded.get(b'peers', b'')
+    peers_ipv6 = decoded.get(b'peers6', b'')
+    ipv4_count = len(peers_ipv4) // 6 if isinstance(peers_ipv4, bytes) else len(peers_ipv4) if isinstance(peers_ipv4, list) else 0
+    ipv6_count = len(peers_ipv6) // 18 if isinstance(peers_ipv6, bytes) else len(peers_ipv6) if isinstance(peers_ipv6, list) else 0
+    return {
+        'status': status,
+        'response_time_ms': response_time_ms,
+        'response_encoding': response_encoding,
+        'warning_message': warning_message,
+        'tracker_id': response_tracker_id,
+        'interval': decoded.get(b'interval', '?'),
+        'min_interval': decoded.get(b'min interval', '?'),
+        'complete': decoded.get(b'complete', 0),
+        'incomplete': decoded.get(b'incomplete', 0),
+        'downloaded': decoded.get(b'downloaded', '?'),
+        'ipv4_peers': ipv4_count,
+        'ipv6_peers': ipv6_count,
+        'body_bytes': len(body),
+    }
+
+
+def _is_http_timeout(exc: Exception) -> bool:
+    if isinstance(exc, (TimeoutError, socket.timeout)):
+        return True
+    if isinstance(exc, urllib.error.URLError):
+        reason = getattr(exc, 'reason', None)
+        if isinstance(reason, (TimeoutError, socket.timeout)):
+            return True
+        if 'timed out' in str(reason or '').lower():
+            return True
+    return 'timed out' in str(exc or '').lower()
+
+
+def _run_http_loop(
+    tracker_url,
+    info_hash_hex,
+    event,
+    scrape,
+    interval_sec,
+    max_iterations,
+    retry_on_timeout,
+    retry_on_error,
+    user_agent,
+    peer_id,
+    num_want,
+    left,
+    accept_encoding,
+    insecure=False,
+):
+    """Continuous HTTP/HTTPS probe loop without UDP CID handling."""
+    parsed = urllib.parse.urlparse(tracker_url)
+    if parsed.scheme.lower() not in ('http', 'https'):
+        print(f"Error: Expected HTTP/HTTPS tracker URL, got {parsed.scheme}://", file=sys.stderr)
+        return 2
+
+    try:
+        if scrape:
+            # Validate hash input early. Full scrape uses None.
+            if info_hash_hex is not None:
+                for hash_hex in (info_hash_hex if isinstance(info_hash_hex, list) else [info_hash_hex]):
+                    parse_info_hash(hash_hex, include_input=True)
+        else:
+            parse_info_hash(info_hash_hex)
+    except ValueError as e:
+        print(f"Error: Invalid info hash — {e}", file=sys.stderr)
+        return 2
+
+    print(f"\n{'─' * 50}")
+    print(f"HTTP LOOP {'SCRAPE' if scrape else event.upper()} → {redact_tracker_url(tracker_url)}")
+    print(f"{'─' * 50}")
+    print(f"Client: {user_agent}")
+    print(
+        "Settings: "
+        f"interval={interval_sec}s "
+        f"max_iterations={'infinite' if max_iterations <= 0 else max_iterations} "
+        f"retry_on_timeout={retry_on_timeout} "
+        f"retry_on_error={retry_on_error} "
+        f"accept_encoding={accept_encoding or 'identity'} "
+        f"tls_verify={'off' if insecure else 'on'}"
+    )
+    print("Press Ctrl+C to stop.")
+
+    cycle_count = 0
+    success_count = 0
+    fail_count = 0
+    response_times_ms = []
+    current_left = max(0, int(left))
+    current_downloaded = 0
+    loop_key = f'{random.randint(0, 0xFFFFFFFF):08X}' if not scrape else None
+    current_tracker_id = None
+
+    try:
+        while True:
+            if max_iterations > 0 and cycle_count >= max_iterations:
+                break
+            cycle_count += 1
+            timeout_attempt = 0
+            error_attempt = 0
+            action = 'scrape' if scrape else 'announce'
+            request_event = _loop_request_event(event, success_count) if not scrape else event
+            request_left = current_left
+            request_downloaded = current_downloaded
+
+            while True:
+                try:
+                    result = _http_loop_probe_once(
+                        tracker_url, info_hash_hex, request_event, scrape, user_agent, peer_id,
+                        num_want, request_left, request_downloaded, accept_encoding, insecure,
+                        loop_key, current_tracker_id
+                    )
+                    elapsed_ms = float(result['response_time_ms'])
+                    response_times_ms.append(elapsed_ms)
+                    success_count += 1
+                    if scrape:
+                        print(
+                            f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] "
+                            f"#{cycle_count} {action} ok "
+                            f"Response Time: {elapsed_ms:.2f} ms "
+                            f"status={result['status']} torrents={result['torrent_count']} "
+                            f"complete={result['complete']} incomplete={result['incomplete']} "
+                            f"downloaded={result['downloaded']} bytes={result['body_bytes']} "
+                            f"tracker_id={result.get('tracker_id') or '-'} "
+                            f"encoding={result['response_encoding']}"
+                        )
+                    else:
+                        print(
+                            f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] "
+                            f"#{cycle_count} {action} ok "
+                            f"Response Time: {elapsed_ms:.2f} ms "
+                            f"status={result['status']} interval={result['interval']} "
+                            f"min_interval={result['min_interval']} complete={result['complete']} "
+                            f"incomplete={result['incomplete']} downloaded={result['downloaded']} "
+                            f"ipv4_peers={result['ipv4_peers']} ipv6_peers={result['ipv6_peers']} "
+                            f"event={request_event} left={request_left} "
+                            f"client_downloaded={request_downloaded} key={loop_key} "
+                            f"tracker_id={result.get('tracker_id') or '-'} "
+                            f"bytes={result['body_bytes']} encoding={result['response_encoding']}"
+                        )
+                        current_left, current_downloaded = _loop_advance_transfer(
+                            current_left, current_downloaded
+                        )
+                    if result.get('tracker_id'):
+                        current_tracker_id = result['tracker_id']
+                    if result.get('warning_message'):
+                        print(
+                            f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] "
+                            f"#{cycle_count} {action} warning: {result['warning_message']}"
+                        )
+                    break
+
+                except Exception as e:
+                    fail_count += 1
+                    if _is_http_timeout(e):
+                        timeout_attempt += 1
+                        print(
+                            f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] "
+                            f"#{cycle_count} {action} timeout: {e} "
+                            f"(attempt={timeout_attempt})"
+                        )
+                        if not _loop_attempt_allowed(timeout_attempt, retry_on_timeout):
+                            return 1
+                    else:
+                        error_attempt += 1
+                        print(
+                            f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] "
+                            f"#{cycle_count} {action} error: {type(e).__name__}: {e} "
+                            f"(attempt={error_attempt})"
+                        )
+                        if not _loop_attempt_allowed(error_attempt, retry_on_error):
+                            return 1
+                    time.sleep(min(30.0, max(0.2, float(interval_sec))))
+                    continue
+
+            if interval_sec > 0:
+                time.sleep(interval_sec)
+    except KeyboardInterrupt:
+        pass
+
+    if not scrape and success_count > 0:
+        try:
+            result = _http_loop_probe_once(
+                tracker_url, info_hash_hex, 'stopped', scrape, user_agent, peer_id,
+                0, current_left, current_downloaded, accept_encoding, insecure,
+                loop_key, current_tracker_id
+            )
+            print(
+                f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] stopped announce sent "
+                f"status={result['status']} left={current_left} "
+                f"client_downloaded={current_downloaded} key={loop_key} "
+                f"tracker_id={result.get('tracker_id') or current_tracker_id or '-'} numwant=0"
+            )
+        except Exception as e:
+            print(
+                f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] "
+                f"stopped announce failed: {type(e).__name__}: {e}"
+            )
+
+    print(f"\n{'─' * 50}")
+    print("HTTP LOOP SUMMARY")
+    print(f"{'─' * 50}")
+    print(f"cycles:          {cycle_count}")
+    print(f"successful:      {success_count}")
+    print(f"failed-attempts: {fail_count}")
+    if response_times_ms:
+        sorted_times = sorted(response_times_ms)
+        n = len(sorted_times)
+        avg_ms = sum(sorted_times) / float(n)
+        p50_ms = sorted_times[int((n - 1) * 0.50)]
+        p95_ms = sorted_times[int((n - 1) * 0.95)]
+        print(f"resp_ms avg:     {avg_ms:.2f}")
+        print(f"resp_ms min:     {sorted_times[0]:.2f}")
+        print(f"resp_ms p50:     {p50_ms:.2f}")
+        print(f"resp_ms p95:     {p95_ms:.2f}")
+        print(f"resp_ms max:     {sorted_times[-1]:.2f}")
+    print(f"{'─' * 50}")
+    return 0
+
+
+def test_http_scrape(tracker_url, info_hash_hex, output_format, user_agent, accept_encoding=DEFAULT_ACCEPT_ENCODING, nocolor=None, insecure=False):
     """Test HTTP/HTTPS tracker scrape endpoint and return response time in milliseconds
 
     info_hash_hex can be:
@@ -1171,7 +1631,7 @@ def test_http_scrape(tracker_url, info_hash_hex, output_format, user_agent, acce
     # Only print headers for table format (not for json/csv)
     if output_format == 'table':
         print(f"\n{'─' * 50}")
-        print(f"HTTP SCRAPE → {tracker_url}")
+        print(f"HTTP SCRAPE → {redact_tracker_url(tracker_url)}")
         print(f"{'─' * 50}")
         print(f"Client: {user_agent}")
         hash_count = len(info_hash_list)
@@ -1179,7 +1639,8 @@ def test_http_scrape(tracker_url, info_hash_hex, output_format, user_agent, acce
             print("Full scrape (no hash)")
         else:
             print(f"Scraping {hash_count} torrent{'s' if hash_count > 1 else ''}")
-        print(f"Scrape URL: {full_url[:120]}{'...' if len(full_url) > 120 else ''}")
+        safe_url = redact_tracker_url(full_url)
+        print(f"Scrape URL: {safe_url[:120]}{'...' if len(safe_url) > 120 else ''}")
 
     req = urllib.request.Request(
         full_url,
@@ -1191,7 +1652,7 @@ def test_http_scrape(tracker_url, info_hash_hex, output_format, user_agent, acce
     )
 
     try:
-        with urllib.request.urlopen(req, timeout=DEFAULT_TIMEOUT) as resp:
+        with urllib.request.urlopen(req, timeout=DEFAULT_TIMEOUT, context=_ssl_context_for_url(full_url, insecure)) as resp:
             response_time_ms = (time.time() - start_time) * 1000
             status = resp.getcode()
             body = resp.read()
@@ -1254,7 +1715,7 @@ def test_http_scrape(tracker_url, info_hash_hex, output_format, user_agent, acce
                             torrents.append(torrent_data)
 
                 data = {
-                    'tracker': tracker_url,
+                    'tracker': redact_tracker_url(tracker_url),
                     'scrape_url': scrape_url,
                     'response_time_ms': round(response_time_ms, 2),
                     'response_encoding': response_encoding,
@@ -1356,7 +1817,21 @@ def udp_connect(sock, addr, transaction_id):
 
     return connection_id
 
-def udp_announce(sock, addr, connection_id, transaction_id, info_hash_bytes, event, peer_id, num_want, left=DEFAULT_LEFT):
+def udp_announce(
+    sock,
+    addr,
+    connection_id,
+    transaction_id,
+    info_hash_bytes,
+    event,
+    peer_id,
+    num_want,
+    left=DEFAULT_LEFT,
+    downloaded=0,
+    announce_key=None,
+    uploaded=0,
+    announce_port=6881,
+):
     """Send UDP announce request and return parsed response"""
     # Map event string to UDP event codes
     event_map = {'started': 2, 'completed': 1, 'stopped': 3, 'none': 0}
@@ -1367,6 +1842,8 @@ def udp_announce(sock, addr, connection_id, transaction_id, info_hash_bytes, eve
     # peer_id (20) + downloaded (8) + left (8) + uploaded (8) + event (4) +
     # ip (4) + key (4) + num_want (4) + port (2)
 
+    if announce_key is None:
+        announce_key = random.randint(0, 0xFFFFFFFF)
     request = struct.pack(
         '!QII20s20sQQQIIIIH',
         connection_id,           # connection_id
@@ -1374,14 +1851,14 @@ def udp_announce(sock, addr, connection_id, transaction_id, info_hash_bytes, eve
         transaction_id,          # transaction_id
         info_hash_bytes,         # info_hash
         peer_id,                 # peer_id
-        0,                       # downloaded
+        max(0, int(downloaded)),  # downloaded
         left,                    # left
-        0,                       # uploaded
+        max(0, int(uploaded)),   # uploaded
         event_code,              # event
         0,                       # ip (0 = default)
-        random.randint(0, 0xFFFFFFFF),  # key
+        int(announce_key) & 0xFFFFFFFF,  # key
         num_want,                # num_want
-        6881                     # port
+        int(announce_port)       # port
     )
 
     sock.sendto(request, addr)
@@ -1478,6 +1955,23 @@ def _loop_attempt_allowed(attempt_count: int, max_attempts: int) -> bool:
     return attempt_count <= max_attempts
 
 
+def _loop_request_event(initial_event: str, successful_announces: int) -> str:
+    """Treat lifecycle events as one-shot in loop mode, like a real client session."""
+    event = initial_event if initial_event in ('started', 'completed', 'stopped') else 'none'
+    if successful_announces <= 0:
+        return event
+    return 'none'
+
+
+def _loop_advance_transfer(left: int, downloaded: int) -> tuple[int, int]:
+    """Move at least one byte from left to downloaded after a successful announce."""
+    left = max(0, int(left))
+    downloaded = max(0, int(downloaded))
+    if left <= 0:
+        return 0, downloaded
+    return left - 1, downloaded + 1
+
+
 def _run_udp_loop(
     tracker_url,
     info_hash_hex,
@@ -1530,7 +2024,7 @@ def _run_udp_loop(
             return 2
 
     print(f"\n{'─' * 50}")
-    print(f"UDP LOOP {'SCRAPE' if scrape else event.upper()} → {tracker_url}")
+    print(f"UDP LOOP {'SCRAPE' if scrape else event.upper()} → {redact_tracker_url(tracker_url)}")
     print(f"{'─' * 50}")
     print(f"Client: {user_agent}")
     print(
@@ -1550,6 +2044,9 @@ def _run_udp_loop(
     reconnect_count = 0
     cid_reuse_count = 0
     response_times_ms = []
+    current_left = max(0, int(left))
+    current_downloaded = 0
+    loop_key = random.randint(0, 0xFFFFFFFF) if not scrape else None
 
     connection_id = None
     cid_issued_at = 0.0
@@ -1583,6 +2080,9 @@ def _run_udp_loop(
 
             timeout_attempt = 0
             error_attempt = 0
+            request_event = _loop_request_event(event, success_count) if not scrape else event
+            request_left = current_left
+            request_downloaded = current_downloaded
 
             while True:
                 if connection_id is None:
@@ -1611,19 +2111,34 @@ def _run_udp_loop(
                         udp_scrape(sock, addr, connection_id, txid, info_hash_list)
                     else:
                         udp_announce(
-                            sock, addr, connection_id, txid, info_hash_bytes, event,
-                            peer_id, num_want, left
+                            sock, addr, connection_id, txid, info_hash_bytes, request_event,
+                            peer_id, num_want, request_left, request_downloaded, loop_key
                         )
                     elapsed_ms = (time.time() - cycle_start) * 1000.0
                     cid_age = int(max(0.0, time.time() - cid_issued_at)) if connection_id is not None else -1
-                    print(
-                        f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] "
-                        f"#{cycle_count} {action} ok "
-                        f"Response Time: {elapsed_ms:.2f} ms "
-                        f"cid_age_sec={cid_age}"
-                    )
+                    if scrape:
+                        print(
+                            f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] "
+                            f"#{cycle_count} {action} ok "
+                            f"Response Time: {elapsed_ms:.2f} ms "
+                            f"cid_age_sec={cid_age}"
+                        )
+                    else:
+                        print(
+                            f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] "
+                            f"#{cycle_count} {action} ok "
+                            f"Response Time: {elapsed_ms:.2f} ms "
+                            f"event={request_event} left={request_left} "
+                            f"client_downloaded={request_downloaded} "
+                            f"key={loop_key:08X} "
+                            f"cid_age_sec={cid_age}"
+                        )
                     success_count += 1
                     response_times_ms.append(float(elapsed_ms))
+                    if not scrape:
+                        current_left, current_downloaded = _loop_advance_transfer(
+                            current_left, current_downloaded
+                        )
                     break
 
                 except TimeoutError as e:
@@ -1717,6 +2232,31 @@ def _run_udp_loop(
     except KeyboardInterrupt:
         pass
     finally:
+        if not scrape and success_count > 0:
+            try:
+                if connection_id is None or (
+                    cid_client_max_age_sec > 0
+                    and (time.time() - cid_issued_at) >= float(cid_client_max_age_sec)
+                ):
+                    txid = random.randint(0, 0xFFFFFFFF)
+                    connection_id = udp_connect(sock, addr, txid)
+                    cid_issued_at = time.time()
+                txid = random.randint(0, 0xFFFFFFFF)
+                udp_announce(
+                    sock, addr, connection_id, txid, info_hash_bytes, 'stopped',
+                    peer_id, 0, current_left, current_downloaded, loop_key
+                )
+                cid_age = int(max(0.0, time.time() - cid_issued_at))
+                print(
+                    f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] stopped announce sent "
+                    f"left={current_left} client_downloaded={current_downloaded} "
+                    f"key={loop_key:08X} numwant=0 cid_age_sec={cid_age}"
+                )
+            except Exception as e:
+                print(
+                    f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] "
+                    f"stopped announce failed: {type(e).__name__}: {e}"
+                )
         try:
             sock.close()
         except Exception:
@@ -1778,7 +2318,7 @@ def test_udp_scrape(tracker_url, info_hash_hex, output_format, user_agent, nocol
 
     if output_format == 'table':
         print(f"\n{'─' * 50}")
-        print(f"UDP SCRAPE → {tracker_url}")
+        print(f"UDP SCRAPE → {redact_tracker_url(tracker_url)}")
         print(f"{'─' * 50}")
         print(f"Client: {user_agent}")
         print(f"Scraping {len(info_hash_list)} torrent{'s' if len(info_hash_list) > 1 else ''}")
@@ -1826,7 +2366,7 @@ def test_udp_scrape(tracker_url, info_hash_hex, output_format, user_agent, nocol
             })
 
         data = {
-            'tracker': tracker_url,
+            'tracker': redact_tracker_url(tracker_url),
             'scrape_url': tracker_url,
             'response_time_ms': round(response_time_ms, 2),
             'response_encoding': None,
@@ -1867,7 +2407,7 @@ def test_udp_tracker(tracker_url, info_hash_hex, event, output_format, show_peer
     # Only print headers for table format
     if output_format == 'table':
         print(f"\n{'─' * 50}")
-        print(f"UDP {event.upper()} → {tracker_url}")
+        print(f"UDP {event.upper()} → {redact_tracker_url(tracker_url)}")
         print(f"{'─' * 50}")
         print(f"Client: {user_agent}")
         print(f"Connecting to: {hostname}:{port}")
@@ -1964,7 +2504,7 @@ def test_udp_tracker(tracker_url, info_hash_hex, event, output_format, show_peer
             apply_dns_lookup_to_peers(peer_list)
 
         data = {
-            'tracker': tracker_url,
+            'tracker': redact_tracker_url(tracker_url),
             'interval': announce_response['interval'],
             'min_interval': '?',  # UDP has no min_interval
             'seeds': announce_response['seeders'],
@@ -2001,7 +2541,7 @@ def test_udp_tracker(tracker_url, info_hash_hex, event, output_format, show_peer
 # Main dispatcher
 # ────────────────────────────────────────────────
 
-def test_tracker(tracker_url, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want, scrape=False, lookup_dns=False, left=DEFAULT_LEFT, accept_encoding=DEFAULT_ACCEPT_ENCODING, nocolor=None, bep34='prefer'):
+def test_tracker(tracker_url, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want, scrape=False, lookup_dns=False, left=DEFAULT_LEFT, accept_encoding=DEFAULT_ACCEPT_ENCODING, nocolor=None, bep34='prefer', insecure=False):
     """Route to HTTP or UDP tracker based on URL scheme (returns (success, response_time) for batch mode)"""
     try:
         targets, _, err = _bep34_resolve_targets(tracker_url, bep34)
@@ -2014,7 +2554,7 @@ def test_tracker(tracker_url, info_hash_hex, event, output_format, show_peers, u
         success, response_time, last_error = _attempt_tracker_targets(
             targets, info_hash_hex, event, output_format, show_peers,
             user_agent, peer_id, num_want, scrape, lookup_dns, left,
-            accept_encoding, nocolor
+            accept_encoding, nocolor, insecure
         )
         if success:
             return True, response_time
@@ -2025,7 +2565,7 @@ def test_tracker(tracker_url, info_hash_hex, event, output_format, show_peers, u
         print(f"Error: {e}", file=sys.stderr)
         return False, None
 
-def _test_tracker_impl(tracker_url, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want, scrape=False, lookup_dns=False, left=DEFAULT_LEFT, accept_encoding=DEFAULT_ACCEPT_ENCODING, nocolor=None):
+def _test_tracker_impl(tracker_url, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want, scrape=False, lookup_dns=False, left=DEFAULT_LEFT, accept_encoding=DEFAULT_ACCEPT_ENCODING, nocolor=None, insecure=False):
     """Internal implementation - routes to HTTP or UDP tracker based on URL scheme, returns response_time"""
     parsed = urllib.parse.urlparse(tracker_url)
     scheme = parsed.scheme.lower()
@@ -2034,13 +2574,13 @@ def _test_tracker_impl(tracker_url, info_hash_hex, event, output_format, show_pe
         if scrape:
             return test_http_scrape(
                 tracker_url, info_hash_hex, output_format, user_agent,
-                accept_encoding, nocolor=nocolor
+                accept_encoding, nocolor=nocolor, insecure=insecure
             )
         else:
             return test_http_tracker(
                 tracker_url, info_hash_hex, event, output_format, show_peers,
                 user_agent, peer_id, num_want, lookup_dns, left, accept_encoding,
-                nocolor=nocolor
+                nocolor=nocolor, insecure=insecure
             )
     elif scheme == 'udp':
         if scrape:
@@ -2057,10 +2597,9 @@ def _test_tracker_impl(tracker_url, info_hash_hex, event, output_format, show_pe
 # Batch mode functionality
 # ────────────────────────────────────────────────
 
-def batch_query_trackers(tracker_file, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want, delay, random_qb, scrape=False, lookup_dns=False, left=DEFAULT_LEFT, accept_encoding=DEFAULT_ACCEPT_ENCODING, nocolor=None, bep34='prefer'):
+def batch_query_trackers(tracker_file, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want, delay, random_qb, scrape=False, lookup_dns=False, left=DEFAULT_LEFT, accept_encoding=DEFAULT_ACCEPT_ENCODING, nocolor=None, bep34='prefer', insecure=False):
     """Query multiple trackers from a file"""
     colors = _color_palette(nocolor)
-    BRIGHT_GREEN = colors['BRIGHT_GREEN']
     GREEN = colors['GREEN']
     YELLOW = colors['YELLOW']
     RED = colors['RED']
@@ -2126,7 +2665,7 @@ def batch_query_trackers(tracker_file, info_hash_hex, event, output_format, show
         success, response_time = test_tracker(
             tracker, info_hash_hex, event, output_format, show_peers, user_agent,
             peer_id, num_want, scrape, lookup_dns, left, accept_encoding,
-            nocolor=nocolor, bep34=bep34
+            nocolor=nocolor, bep34=bep34, insecure=insecure
         )
 
         if success:
@@ -2195,7 +2734,7 @@ def batch_query_trackers(tracker_file, info_hash_hex, event, output_format, show
 # Retry Logic
 # ────────────────────────────────────────────────
 
-def test_tracker_with_retry(tracker_url, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want, scrape, lookup_dns, max_attempts, left=DEFAULT_LEFT, accept_encoding=DEFAULT_ACCEPT_ENCODING, nocolor=None, bep34='prefer'):
+def test_tracker_with_retry(tracker_url, info_hash_hex, event, output_format, show_peers, user_agent, peer_id, num_want, scrape, lookup_dns, max_attempts, left=DEFAULT_LEFT, accept_encoding=DEFAULT_ACCEPT_ENCODING, nocolor=None, bep34='prefer', insecure=False):
     """
     Retry tracker connection until successful.
 
@@ -2238,7 +2777,7 @@ def test_tracker_with_retry(tracker_url, info_hash_hex, event, output_format, sh
         success, response_time, last_error = _attempt_tracker_targets(
             targets, info_hash_hex, event, output_format, show_peers,
             user_agent, peer_id, num_want, scrape, lookup_dns, left,
-            accept_encoding, nocolor
+            accept_encoding, nocolor, insecure
         )
         if not success and _should_emit_attempt_error(last_error):
             print(f"Error: {last_error}", file=sys.stderr)
@@ -2255,6 +2794,433 @@ def test_tracker_with_retry(tracker_url, info_hash_hex, event, output_format, sh
         # Wait before retry
         print(f"{YELLOW}Connection failed. Retrying in {retry_delay} seconds...{NC}")
         time.sleep(retry_delay)
+
+
+# ────────────────────────────────────────────────
+# Deterministic lifecycle scenarios
+# ────────────────────────────────────────────────
+
+def _utc_timestamp():
+    return datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+
+
+def _scenario_int(value, name, minimum=0, maximum=MAX_WIRE_COUNTER):
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be an integer")
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be an integer") from exc
+    if parsed < minimum or parsed > maximum:
+        raise ValueError(f"{name} must be between {minimum} and {maximum}")
+    return parsed
+
+
+def _scenario_decimal(value, name, minimum=Decimal('0')):
+    try:
+        parsed = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a finite decimal number") from exc
+    if not parsed.is_finite() or parsed < minimum:
+        raise ValueError(f"{name} must be a finite number >= {minimum}")
+    return parsed
+
+
+def parse_peer_id(peer_id_hex=None, peer_id_ascii=None, default=None):
+    if peer_id_hex is not None and peer_id_ascii is not None:
+        raise ValueError("Specify only one of peer_id_hex and peer_id_ascii")
+    if peer_id_hex is not None:
+        try:
+            peer_id = bytes.fromhex(str(peer_id_hex))
+        except ValueError as exc:
+            raise ValueError("peer_id_hex must be hexadecimal") from exc
+    elif peer_id_ascii is not None:
+        try:
+            peer_id = str(peer_id_ascii).encode('ascii')
+        except UnicodeEncodeError as exc:
+            raise ValueError("peer_id_ascii must contain only ASCII characters") from exc
+    elif default is not None:
+        peer_id = default
+    else:
+        peer_id = DEFAULT_PEER_ID
+    if len(peer_id) != 20:
+        raise ValueError("peer ID must be exactly 20 bytes")
+    return peer_id
+
+
+def _sanitize_scenario_text(value, token):
+    text = str(value)
+    if token:
+        text = text.replace(token, '<redacted>')
+        text = text.replace(quote_query_value(token), '<redacted>')
+    return text
+
+
+def _write_evidence_atomic(path, evidence):
+    directory = os.path.dirname(os.path.abspath(path)) or '.'
+    os.makedirs(directory, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix='.tracker-query-evidence-', dir=directory)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+            json.dump(evidence, handle, indent=2, sort_keys=True)
+            handle.write('\n')
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    except Exception:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+
+
+def _load_scenario(path):
+    with open(path, 'r', encoding='utf-8') as handle:
+        document = json.load(handle)
+    if not isinstance(document, dict):
+        raise ValueError("Scenario root must be an object")
+    if document.get('version') != 1:
+        raise ValueError("Scenario version must be 1")
+    if not isinstance(document.get('name'), str) or not document['name'].strip():
+        raise ValueError("Scenario name must be a non-empty string")
+    defaults = document.get('defaults', {})
+    steps = document.get('steps')
+    if not isinstance(defaults, dict):
+        raise ValueError("Scenario defaults must be an object")
+    if not isinstance(steps, list) or not steps:
+        raise ValueError("Scenario steps must be a non-empty array")
+    if len(steps) > MAX_SCENARIO_STEPS:
+        raise ValueError(f"Scenario exceeds {MAX_SCENARIO_STEPS} steps")
+    return document
+
+
+def _scenario_response_assertions(expect, success, response, error):
+    if expect is None:
+        expect = {'success': True}
+    if not isinstance(expect, dict):
+        raise ValueError("expect must be an object")
+    expected_success = bool(expect.get('success', True))
+    assertions = []
+    assertions.append({
+        'field': 'success',
+        'expected': expected_success,
+        'actual': success,
+        'passed': success == expected_success,
+    })
+    for field, expected in expect.items():
+        if field == 'success':
+            continue
+        if field == 'error_contains':
+            actual = error or ''
+            passed = str(expected) in actual
+        else:
+            actual = response.get(field) if response else None
+            passed = actual == expected
+        assertions.append({
+            'field': field,
+            'expected': expected,
+            'actual': actual,
+            'passed': passed,
+        })
+    return assertions
+
+
+def _scenario_udp_announce(context, tracker_url, state):
+    if context.get('sock') is None:
+        hostname, tracker_port = parse_udp_url(tracker_url)
+        sock, addr, family = resolve_udp_socket_and_addr(hostname, tracker_port, 'json')
+        context.update({'sock': sock, 'addr': addr, 'family': family})
+    cid_age = time.monotonic() - context.get('connection_issued_at', 0)
+    if context.get('connection_id') is None or cid_age >= DEFAULT_CID_CLIENT_MAX_AGE_SEC:
+        transaction_id = random.randint(0, 0xFFFFFFFF)
+        context['connection_id'] = udp_connect(
+            context['sock'], context['addr'], transaction_id
+        )
+        context['connection_issued_at'] = time.monotonic()
+    transaction_id = random.randint(0, 0xFFFFFFFF)
+    result = udp_announce(
+        context['sock'],
+        context['addr'],
+        context['connection_id'],
+        transaction_id,
+        parse_info_hash(state['info_hash']),
+        state['event'],
+        state['peer_id'],
+        state['num_want'],
+        state['left'],
+        state['downloaded'],
+        state['key'],
+        state['uploaded'],
+        state['port'],
+    )
+    peers_data = result.pop('peers_data', b'')
+    result['peer_bytes'] = len(peers_data)
+    return result
+
+
+def _scenario_announce(tracker_url, state, user_agent, accept_encoding, insecure, udp_context):
+    started = time.monotonic()
+    scheme = urllib.parse.urlsplit(tracker_url).scheme.lower()
+    if scheme in ('http', 'https'):
+        result = _http_loop_probe_once(
+            tracker_url,
+            state['info_hash'],
+            state['event'],
+            False,
+            user_agent,
+            state['peer_id'],
+            state['num_want'],
+            state['left'],
+            state['downloaded'],
+            accept_encoding,
+            insecure,
+            state['key'],
+            state.get('tracker_id'),
+            state['uploaded'],
+            state['port'],
+        )
+        if result.get('tracker_id'):
+            state['tracker_id'] = result['tracker_id']
+    elif scheme == 'udp':
+        result = _scenario_udp_announce(udp_context, tracker_url, state)
+    else:
+        raise ValueError("Scenario tracker must use http, https, or udp")
+    result['response_time_ms'] = round((time.monotonic() - started) * 1000.0, 2)
+    return result
+
+
+def _scenario_request_record(state):
+    return {
+        'info_hash': state['info_hash'].lower(),
+        'peer_id_hex': state['peer_id'].hex(),
+        'port': state['port'],
+        'key': state['key'],
+        'event': state['event'],
+        'uploaded': state['uploaded'],
+        'downloaded': state['downloaded'],
+        'left': state['left'],
+        'num_want': state['num_want'],
+    }
+
+
+def run_tracker_scenario(
+    scenario_path,
+    tracker_url,
+    token=None,
+    evidence_path=None,
+    time_scale=1.0,
+    strict=False,
+    user_agent=DEFAULT_USER_AGENT,
+    accept_encoding=DEFAULT_ACCEPT_ENCODING,
+    insecure=False,
+):
+    """Run a deterministic announce lifecycle and return a stable exit class."""
+    started_at = _utc_timestamp()
+    evidence = {
+        'evidence_version': 1,
+        'started_at': started_at,
+        'tracker': redact_tracker_url(tracker_url),
+        'steps': [],
+    }
+    udp_context = {}
+    exit_code = 0
+    evidence_write_failed = False
+    try:
+        scenario = _load_scenario(scenario_path)
+        evidence['scenario'] = {'name': scenario['name'], 'version': scenario['version']}
+        scale = _scenario_decimal(time_scale, 'scenario time scale')
+        defaults = scenario.get('defaults', {})
+        state = {
+            'info_hash': str(defaults.get('info_hash', DEFAULT_INFO_HASH_HEX)),
+            'peer_id': parse_peer_id(
+                defaults.get('peer_id_hex'), defaults.get('peer_id_ascii'), DEFAULT_PEER_ID
+            ),
+            'port': _scenario_int(defaults.get('port', 6881), 'port', 1, 65535),
+            'key': _scenario_int(defaults.get('key', random.randint(0, 0xFFFFFFFF)), 'key', 0, 0xFFFFFFFF),
+            'num_want': _scenario_int(defaults.get('num_want', 0), 'num_want', 0, 0x7FFFFFFF),
+            'uploaded': _scenario_int(defaults.get('uploaded', 0), 'uploaded'),
+            'downloaded': _scenario_int(defaults.get('downloaded', 0), 'downloaded'),
+            'left': _scenario_int(defaults.get('left', DEFAULT_LEFT), 'left'),
+            'event': 'none',
+            'tracker_id': None,
+        }
+        parse_info_hash(state['info_hash'])
+        scheme = urllib.parse.urlsplit(tracker_url).scheme.lower()
+        if token:
+            if scheme not in ('http', 'https'):
+                raise ValueError("Announce tokens are supported only for HTTP/HTTPS scenarios")
+            tracker_url = add_announce_token(tracker_url, token)
+            evidence['tracker'] = redact_tracker_url(tracker_url)
+
+        generated_steps = 0
+        simulated_elapsed = Decimal('0')
+        upload_remainder = Decimal('0')
+        download_remainder = Decimal('0')
+
+        def execute_announce(name, source_action, expect):
+            nonlocal generated_steps, exit_code
+            generated_steps += 1
+            if generated_steps > MAX_SCENARIO_STEPS:
+                raise ValueError(f"Scenario generates more than {MAX_SCENARIO_STEPS} operations")
+            record = {
+                'name': name,
+                'action': source_action,
+                'simulated_elapsed_sec': float(simulated_elapsed),
+                'request': _scenario_request_record(state),
+                'started_at': _utc_timestamp(),
+            }
+            try:
+                response = _scenario_announce(
+                    tracker_url, state, user_agent, accept_encoding, insecure, udp_context
+                )
+                success = True
+                error = None
+            except Exception as exc:
+                response = None
+                success = False
+                error = _sanitize_scenario_text(exc, token)
+            record['success'] = success
+            record['response'] = response
+            record['error'] = error
+            record['assertions'] = _scenario_response_assertions(expect, success, response, error)
+            record['passed'] = all(item['passed'] for item in record['assertions'])
+            evidence['steps'].append(record)
+            status = 'PASS' if record['passed'] else 'FAIL'
+            print(
+                f"[{status}] {name}: event={state['event']} uploaded={state['uploaded']} "
+                f"downloaded={state['downloaded']} left={state['left']}"
+            )
+            if not record['passed']:
+                exit_code = 1
+                if strict:
+                    raise RuntimeError("strict scenario assertion failed")
+
+        total_declared_duration = Decimal('0')
+        for index, step in enumerate(scenario['steps'], 1):
+            if not isinstance(step, dict):
+                raise ValueError(f"Scenario step {index} must be an object")
+            action = step.get('action')
+            name = str(step.get('name') or f"step-{index}")
+            if action == 'announce':
+                event = str(step.get('event', 'none'))
+                if event not in ('started', 'none', 'completed', 'stopped'):
+                    raise ValueError(f"{name}: invalid announce event")
+                for field in ('uploaded', 'downloaded', 'left'):
+                    if field in step:
+                        state[field] = _scenario_int(step[field], f"{name}.{field}")
+                state['event'] = event
+                execute_announce(name, action, step.get('expect'))
+            elif action == 'transfer':
+                duration = _scenario_decimal(step.get('duration_sec'), f"{name}.duration_sec", Decimal('0.000001'))
+                report_interval = _scenario_decimal(
+                    step.get('report_interval_sec'),
+                    f"{name}.report_interval_sec",
+                    Decimal('0.000001'),
+                )
+                upload_rate = _scenario_decimal(
+                    step.get('upload_rate_mbps', 0), f"{name}.upload_rate_mbps"
+                )
+                download_rate = _scenario_decimal(
+                    step.get('download_rate_mbps', 0), f"{name}.download_rate_mbps"
+                )
+                total_declared_duration += duration
+                if total_declared_duration > MAX_SCENARIO_DURATION_SEC:
+                    raise ValueError(
+                        f"Scenario duration exceeds {MAX_SCENARIO_DURATION_SEC} seconds"
+                    )
+                remaining = duration
+                tick = 0
+                while remaining > 0:
+                    tick += 1
+                    interval = min(report_interval, remaining)
+                    wall_sleep = float(interval * scale)
+                    if wall_sleep > 0:
+                        time.sleep(wall_sleep)
+                    previous_left = state['left']
+                    upload_exact = upload_remainder + (upload_rate * Decimal(1_000_000) * interval / 8)
+                    upload_delta = int(upload_exact.to_integral_value(rounding=ROUND_FLOOR))
+                    upload_remainder = upload_exact - upload_delta
+                    download_exact = download_remainder + (download_rate * Decimal(1_000_000) * interval / 8)
+                    download_capacity = int(download_exact.to_integral_value(rounding=ROUND_FLOOR))
+                    download_remainder = download_exact - download_capacity
+                    download_delta = min(state['left'], download_capacity)
+                    state['uploaded'] = _scenario_int(
+                        state['uploaded'] + upload_delta, f"{name}.uploaded"
+                    )
+                    state['downloaded'] = _scenario_int(
+                        state['downloaded'] + download_delta, f"{name}.downloaded"
+                    )
+                    state['left'] -= download_delta
+                    state['event'] = (
+                        'completed' if previous_left > 0 and state['left'] == 0 else 'none'
+                    )
+                    simulated_elapsed += interval
+                    remaining -= interval
+                    execute_announce(
+                        f"{name} report {tick}", action, step.get('expect')
+                    )
+                if step.get('stop_at_end'):
+                    state['event'] = 'stopped'
+                    execute_announce(f"{name} stopped", action, step.get('stop_expect'))
+            elif action == 'sleep':
+                duration = _scenario_decimal(step.get('duration_sec'), f"{name}.duration_sec")
+                total_declared_duration += duration
+                if total_declared_duration > MAX_SCENARIO_DURATION_SEC:
+                    raise ValueError(
+                        f"Scenario duration exceeds {MAX_SCENARIO_DURATION_SEC} seconds"
+                    )
+                wall_sleep = float(duration * scale)
+                if wall_sleep > 0:
+                    time.sleep(wall_sleep)
+                simulated_elapsed += duration
+                evidence['steps'].append({
+                    'name': name,
+                    'action': action,
+                    'duration_sec': float(duration),
+                    'simulated_elapsed_sec': float(simulated_elapsed),
+                    'passed': True,
+                })
+                print(f"[PASS] {name}: simulated sleep {duration}s")
+            elif action == 'checkpoint':
+                evidence['steps'].append({
+                    'name': name,
+                    'action': action,
+                    'simulated_elapsed_sec': float(simulated_elapsed),
+                    'state': _scenario_request_record(state),
+                    'passed': True,
+                })
+                print(f"[PASS] {name}: checkpoint recorded")
+            else:
+                raise ValueError(f"{name}: unsupported action {action!r}")
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        exit_code = 2
+        evidence['error'] = _sanitize_scenario_text(exc, token)
+        print(f"Scenario error: {evidence['error']}", file=sys.stderr)
+    except RuntimeError as exc:
+        if exit_code == 0:
+            exit_code = 1
+        evidence['error'] = _sanitize_scenario_text(exc, token)
+    finally:
+        sock = udp_context.get('sock')
+        if sock is not None:
+            sock.close()
+        evidence['finished_at'] = _utc_timestamp()
+        evidence['passed'] = exit_code == 0
+        evidence['exit_code'] = exit_code
+        evidence['summary'] = {
+            'passed_steps': sum(1 for item in evidence['steps'] if item.get('passed')),
+            'failed_steps': sum(1 for item in evidence['steps'] if not item.get('passed')),
+            'total_steps': len(evidence['steps']),
+        }
+        if evidence_path:
+            try:
+                _write_evidence_atomic(evidence_path, evidence)
+            except Exception as exc:
+                print(f"Evidence write failed: {exc}", file=sys.stderr)
+                evidence_write_failed = True
+    return 4 if evidence_write_failed else exit_code
 
 # ────────────────────────────────────────────────
 # Argument parsing
@@ -2359,6 +3325,12 @@ def main():
     )
 
     parser.add_argument(
+        '-k', '--insecure',
+        action='store_true',
+        help="Allow insecure HTTPS tracker connections (disable TLS certificate and hostname verification, like curl -k)."
+    )
+
+    parser.add_argument(
         '-a', '--accept-encoding',
         metavar='MODE',
         action='append',
@@ -2425,14 +3397,14 @@ def main():
         metavar='N',
         type=int,
         default=DEFAULT_LOOP_RETRY_ON_TIMEOUT,
-        help="Retries per loop cycle on timeout in UDP loop mode. -1 means infinite."
+        help="Retries per loop cycle on timeout in loop mode. -1 means infinite."
     )
     parser.add_argument(
         '--retry-on-error',
         metavar='N',
         type=int,
         default=DEFAULT_LOOP_RETRY_ON_ERROR,
-        help="Retries per loop cycle on non-timeout errors in UDP loop mode. -1 means infinite."
+        help="Retries per loop cycle on non-timeout errors in loop mode. -1 means infinite."
     )
     parser.add_argument(
         '--reconnect-on-tracker-error',
@@ -2446,6 +3418,44 @@ def main():
         help="UDP loop convenience mode: sets --reconnect-on-tracker-error off, "
              "--cid-client-max-age-sec 0, and BitComet-like identity (peer_id -BC0220-...)."
     )
+    parser.add_argument(
+        '--scenario',
+        metavar='PATH',
+        help="Run a version 1 deterministic lifecycle scenario from JSON."
+    )
+    parser.add_argument(
+        '--evidence-json',
+        metavar='PATH',
+        help="Atomically write secret-redacted scenario evidence as JSON."
+    )
+    parser.add_argument(
+        '--scenario-time-scale',
+        metavar='FACTOR',
+        type=float,
+        default=1.0,
+        help="Scenario wall-clock scale. 1 is real time, 0 skips waits while retaining simulated byte totals."
+    )
+    parser.add_argument(
+        '--strict',
+        action='store_true',
+        help="Stop a scenario at its first failed assertion."
+    )
+    token_group = parser.add_mutually_exclusive_group()
+    token_group.add_argument(
+        '--announce-token-file',
+        metavar='PATH',
+        help="Read one announce token from a protected regular file for scenario mode."
+    )
+    token_group.add_argument(
+        '--announce-token-stdin',
+        action='store_true',
+        help="Read one announce token from stdin for scenario mode."
+    )
+    parser.add_argument(
+        '--allow-insecure-token-file',
+        action='store_true',
+        help="Allow group/other permissions on a synthetic test token file."
+    )
 
     args = parser.parse_args()
 
@@ -2458,6 +3468,46 @@ def main():
     # Set global NOCOLOR flag
     global NOCOLOR
     NOCOLOR = args.nocolor
+
+    if args.evidence_json and not args.scenario:
+        print("Error: --evidence-json requires --scenario", file=sys.stderr)
+        sys.exit(2)
+    if (args.announce_token_file or args.announce_token_stdin) and not args.scenario:
+        print("Error: announce-token input currently requires --scenario", file=sys.stderr)
+        sys.exit(2)
+    if args.allow_insecure_token_file and not args.announce_token_file:
+        print("Error: --allow-insecure-token-file requires --announce-token-file", file=sys.stderr)
+        sys.exit(2)
+    if args.scenario:
+        if args.batch or args.loop or args.retry is not None or args.scrape or args.full_scrape:
+            print(
+                "Error: --scenario cannot be combined with batch, loop, retry, or scrape mode",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        token = None
+        if args.announce_token_file or args.announce_token_stdin:
+            try:
+                token = read_announce_token(
+                    args.announce_token_file,
+                    args.announce_token_stdin,
+                    args.allow_insecure_token_file,
+                )
+            except (OSError, ValueError) as exc:
+                print(f"Error: {exc}", file=sys.stderr)
+                sys.exit(2)
+        rc = run_tracker_scenario(
+            args.scenario,
+            args.tracker,
+            token=token,
+            evidence_path=args.evidence_json,
+            time_scale=args.scenario_time_scale,
+            strict=args.strict,
+            user_agent=DEFAULT_USER_AGENT,
+            accept_encoding=args.accept_encoding,
+            insecure=args.insecure,
+        )
+        sys.exit(rc)
 
     # Validate --retry only works in single-tracker mode
     if args.retry is not None and args.batch:
@@ -2523,7 +3573,7 @@ def main():
             args.file, info_hash, args.event, args.format, args.show_peers,
             user_agent, peer_id, args.num_want, args.delay, args.random_qb,
             args.scrape, args.lookup, left, args.accept_encoding,
-            nocolor=args.nocolor, bep34=args.bep34
+            nocolor=args.nocolor, bep34=args.bep34, insecure=args.insecure
         )
     else:
         # Single tracker mode
@@ -2534,26 +3584,58 @@ def main():
                 sys.exit(2)
             if bep34_err:
                 print(f"Warning: {bep34_err}", file=sys.stderr)
-            udp_targets = [t for t in targets if urllib.parse.urlparse(t).scheme.lower() == 'udp']
-            if not udp_targets:
-                print("Error: --loop is currently supported for UDP trackers only", file=sys.stderr)
+            requested_scheme = urllib.parse.urlparse(args.tracker).scheme.lower()
+            if requested_scheme == 'udp':
+                loop_targets = [t for t in targets if urllib.parse.urlparse(t).scheme.lower() == 'udp']
+            elif requested_scheme in ('http', 'https'):
+                loop_targets = [
+                    t for t in targets
+                    if urllib.parse.urlparse(t).scheme.lower() in ('http', 'https')
+                ]
+            else:
+                loop_targets = [
+                    t for t in targets
+                    if urllib.parse.urlparse(t).scheme.lower() in ('udp', 'http', 'https')
+                ]
+            if not loop_targets:
+                print("Error: --loop requires a UDP, HTTP, or HTTPS tracker target matching the requested tracker scheme", file=sys.stderr)
                 sys.exit(2)
-            rc = _run_udp_loop(
-                udp_targets[0],
-                info_hash,
-                args.event,
-                args.scrape,
-                max(0.0, float(args.interval)),
-                int(args.max_iterations),
-                int(args.cid_client_max_age_sec),
-                int(args.retry_on_timeout),
-                int(args.retry_on_error),
-                str(args.reconnect_on_tracker_error).lower() != 'off',
-                user_agent,
-                peer_id,
-                args.num_want,
-                left
-            )
+            loop_target = loop_targets[0]
+            loop_scheme = urllib.parse.urlparse(loop_target).scheme.lower()
+            if loop_scheme == 'udp':
+                rc = _run_udp_loop(
+                    loop_target,
+                    info_hash,
+                    args.event,
+                    args.scrape,
+                    max(0.0, float(args.interval)),
+                    int(args.max_iterations),
+                    int(args.cid_client_max_age_sec),
+                    int(args.retry_on_timeout),
+                    int(args.retry_on_error),
+                    str(args.reconnect_on_tracker_error).lower() != 'off',
+                    user_agent,
+                    peer_id,
+                    args.num_want,
+                    left
+                )
+            else:
+                rc = _run_http_loop(
+                    loop_target,
+                    info_hash,
+                    args.event,
+                    args.scrape,
+                    max(0.0, float(args.interval)),
+                    int(args.max_iterations),
+                    int(args.retry_on_timeout),
+                    int(args.retry_on_error),
+                    user_agent,
+                    peer_id,
+                    args.num_want,
+                    left,
+                    args.accept_encoding,
+                    args.insecure
+                )
             sys.exit(rc)
         elif args.retry is not None:
             # Retry mode: retry until success or max attempts
@@ -2561,14 +3643,14 @@ def main():
             success, response_time = test_tracker_with_retry(
                 args.tracker, info_hash, args.event, args.format, args.show_peers,
                 user_agent, peer_id, args.num_want, args.scrape, args.lookup,
-                max_attempts, left, args.accept_encoding, nocolor=args.nocolor, bep34=args.bep34
+                max_attempts, left, args.accept_encoding, nocolor=args.nocolor, bep34=args.bep34, insecure=args.insecure
             )
         else:
             # Normal mode: single attempt
             success, response_time = test_tracker(
                 args.tracker, info_hash, args.event, args.format, args.show_peers,
                 user_agent, peer_id, args.num_want, args.scrape, args.lookup,
-                left, args.accept_encoding, nocolor=args.nocolor, bep34=args.bep34
+                left, args.accept_encoding, nocolor=args.nocolor, bep34=args.bep34, insecure=args.insecure
             )
         sys.exit(0 if success else 1)
 

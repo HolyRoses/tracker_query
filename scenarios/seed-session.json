@@ -1,0 +1,37 @@
+{
+  "version": 1,
+  "name": "seed-session",
+  "defaults": {
+    "info_hash": "3333333333333333333333333333333333333333",
+    "peer_id_ascii": "-qB5210-SCENARIO0004",
+    "port": 51413,
+    "key": 270544962,
+    "num_want": 0,
+    "uploaded": 0,
+    "downloaded": 500000000,
+    "left": 0
+  },
+  "steps": [
+    {
+      "name": "start as seeder",
+      "action": "announce",
+      "event": "started",
+      "expect": {"success": true}
+    },
+    {
+      "name": "seed for five minutes",
+      "action": "transfer",
+      "duration_sec": 300,
+      "report_interval_sec": 60,
+      "download_rate_mbps": 0,
+      "upload_rate_mbps": 50,
+      "stop_at_end": true,
+      "expect": {"success": true},
+      "stop_expect": {"success": true}
+    },
+    {
+      "name": "capture seed totals",
+      "action": "checkpoint"
+    }
+  ]
+}
