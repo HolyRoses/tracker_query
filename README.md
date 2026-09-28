@@ -19,7 +19,7 @@ Use it only with trackers and swarms you are authorized to test. Announce reques
 
 ## Requirements
 
-- Python 3.9 or newer
+- Python 3.8 or newer
 - No required third-party package for basic HTTP and UDP queries
 
 Optional packages enable additional behavior:

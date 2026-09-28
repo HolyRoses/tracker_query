@@ -20,6 +20,8 @@ Examples:
   ./tracker_query.py -t https://tracker.example/announce -R 5
 """
 
+from __future__ import annotations
+
 import sys
 import argparse
 import gzip
