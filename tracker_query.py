@@ -1258,7 +1258,16 @@ def test_http_tracker(tracker_url, info_hash_hex, event, output_format, show_pee
     # Return response time for batch mode tracking
     return round(response_time_ms, 2)
 
-def _http_request_bencoded(url, user_agent, accept_encoding, insecure=False):
+def _build_http_loop_opener(insecure=False):
+    """Build loop-mode handlers before response timing begins."""
+    if insecure:
+        return urllib.request.build_opener(
+            urllib.request.HTTPSHandler(context=ssl._create_unverified_context())
+        )
+    return urllib.request.build_opener()
+
+
+def _http_request_bencoded(url, user_agent, accept_encoding, insecure=False, opener=None):
     start_time = time.time()
     req = urllib.request.Request(
         url,
@@ -1268,7 +1277,15 @@ def _http_request_bencoded(url, user_agent, accept_encoding, insecure=False):
         },
         method='GET'
     )
-    with urllib.request.urlopen(req, timeout=DEFAULT_TIMEOUT, context=_ssl_context_for_url(url, insecure)) as resp:
+    if opener is None:
+        response = urllib.request.urlopen(
+            req,
+            timeout=DEFAULT_TIMEOUT,
+            context=_ssl_context_for_url(url, insecure),
+        )
+    else:
+        response = opener.open(req, timeout=DEFAULT_TIMEOUT)
+    with response as resp:
         response_time_ms = (time.time() - start_time) * 1000.0
         status = int(resp.getcode() or 0)
         body = resp.read()
@@ -1305,7 +1322,7 @@ def _build_http_scrape_url_for_loop(tracker_url, info_hash_hex):
 def _http_loop_probe_once(tracker_url, info_hash_hex, event, scrape, user_agent, peer_id,
                           num_want, left, downloaded, accept_encoding, insecure=False,
                           tracker_key=None, tracker_id=None, uploaded=0,
-                          announce_port=6881):
+                          announce_port=6881, opener=None):
     if scrape:
         url = _build_http_scrape_url_for_loop(tracker_url, info_hash_hex)
     else:
@@ -1328,7 +1345,7 @@ def _http_loop_probe_once(tracker_url, info_hash_hex, event, scrape, user_agent,
         )
 
     status, body, decoded, response_time_ms, response_encoding = _http_request_bencoded(
-        url, user_agent, accept_encoding, insecure
+        url, user_agent, accept_encoding, insecure, opener
     )
     failure_reason = _decode_bencoded_text(decoded.get(b'failure reason', b'')).strip() or None
     warning_message = _decode_bencoded_text(decoded.get(b'warning message', b'')).strip() or None
@@ -1428,6 +1445,8 @@ def _run_http_loop(
         print(f"Error: Invalid info hash — {e}", file=sys.stderr)
         return 2
 
+    http_opener = _build_http_loop_opener(insecure)
+
     print(f"\n{'─' * 50}")
     print(f"HTTP LOOP {'SCRAPE' if scrape else event.upper()} → {redact_tracker_url(tracker_url)}")
     print(f"{'─' * 50}")
@@ -1469,7 +1488,7 @@ def _run_http_loop(
                     result = _http_loop_probe_once(
                         tracker_url, info_hash_hex, request_event, scrape, user_agent, peer_id,
                         num_want, request_left, request_downloaded, accept_encoding, insecure,
-                        loop_key, current_tracker_id
+                        loop_key, current_tracker_id, opener=http_opener
                     )
                     elapsed_ms = float(result['response_time_ms'])
                     response_times_ms.append(elapsed_ms)
@@ -1544,7 +1563,7 @@ def _run_http_loop(
             result = _http_loop_probe_once(
                 tracker_url, info_hash_hex, 'stopped', scrape, user_agent, peer_id,
                 0, current_left, current_downloaded, accept_encoding, insecure,
-                loop_key, current_tracker_id
+                loop_key, current_tracker_id, opener=http_opener
             )
             print(
                 f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] stopped announce sent "
